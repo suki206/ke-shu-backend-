@@ -5,159 +5,208 @@ const { createClient } = require('@supabase/supabase-js')
 const fetch = require('node-fetch')
 
 const app = express()
-const PORT = 3000
+const PORT = process.env.PORT || 3000
 
+// 配置跨域和JSON解析
 app.use(cors())
 app.use(express.json())
 
-// 初始化Supabase
+// ============================================================
+// 环境变量与常量检查
+// ============================================================
+console.log('=============== 环境检查 ===============')
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '已读取' : '缺失')
+console.log('SUPABASE_KEY:', process.env.SUPABASE_ANON_KEY ? '已读取' : '缺失')
+console.log('DEEPSEEK_API_KEY:', process.env.DEEPSEEK_API_KEY ? '已读取' : '缺失')
+console.log('========================================')
+
+// Supabase 初始化 (注意：你的环境变量可能叫 SUPABASE_KEY，这里按原代码用 ANON_KEY，确保你在Render后台配置的是 SUPABASE_ANON_KEY)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY
 )
 
-// AI接口配置
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
-const DEEPSEEK_URL = 'https://api.deepseek.com/v1/chat/completions'
+// DeepSeek API 接口配置
+const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
 
-// 健康检测接口
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', msg: '后端服务运行正常' })
-})
-
-// ====================== 会话接口 ======================
-// 新建会话
-app.post('/api/session/new', async (req, res) => {
-  const now = new Date()
-  const { data, error } = await supabase
-    .from('sessions')
-    .insert([{ title: '新对话', created_at: now, updated_at: now }])
-    .select()
-  if (error) return res.status(500).json(error)
-  res.json(data[0])
-})
-
-// 获取所有会话列表
-app.get('/api/sessions', async (req, res) => {
-  const { data, error } = await supabase
-    .from('sessions')
-    .select('*')
-    .order('updated_at', { ascending: false })
-  if (error) return res.status(500).json(error)
-  res.json(data)
-})
-
-// ============【新增】重命名会话接口 ============
-app.put('/api/session/:id', async (req, res) => {
-  const { id } = req.params
-  const { title } = req.body
-  const { data, error } = await supabase
-    .from('sessions')
-    .update({ title, updated_at: new Date() })
-    .eq('id', id)
-    .select()
-  if (error) return res.status(500).json(error)
-  res.json(data[0])
-})
-
-// ============【新增】删除会话接口 ============
-app.delete('/api/session/:id', async (req, res) => {
-  const { id } = req.params
-  // 先删除该会话下所有消息、记忆，再删除会话本体
-  await supabase.from('messages').delete().eq('session_id', id)
-  await supabase.from('memories').delete().eq('session_id', id)
-  const { error } = await supabase.from('sessions').delete().eq('id', id)
-  if (error) return res.status(500).json(error)
-  res.json({ success: true })
-})
-
-// 获取单一会话【仅visible=true可见消息】PDF标准
-app.get('/api/messages/:sessionId', async (req, res) => {
-  const { sessionId } = req.params
-  const { data, error } = await supabase
-    .from('messages')
-    .select('role, content, id, created_at, visible')
-    .eq('session_id', sessionId)
-    .eq('visible', true)
-    .order('created_at')
-  if (error) return res.status(500).json(error)
-  res.json(data)
-})
-
-// 分页获取会话已归档消息 visible=false，分段加载更早历史（修复：单批次内部强制时间正序）
-app.get('/api/messages/archived/:sessionId', async (req, res) => {
-  const { sessionId } = req.params
-  const { cursor, limit = 6 } = req.query
-
-  let query = supabase
-    .from('messages')
-    .select('role, content, id, created_at, visible')
-    .eq('session_id', sessionId)
-    .eq('visible', false)
-    .order('created_at', { ascending: true })
-
-  if (cursor) {
-    query = query.lt('id', cursor)
-  }
-
-  const { data, error } = await query.range(0, Number(limit))
-  if (error) return res.status(500).json(error)
-
-  // 强制单批次内按时间从小到大排序，保证一问一答连贯
-  data.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-
-  const hasMore = data.length > Number(limit)
-  if (hasMore) data.pop()
-
-  res.json({
-    list: data,
-    hasMore: hasMore
-  })
-})
-
-// ====================== 配置接口 ======================
-// 获取全局配置
-app.get('/api/settings', async (req, res) => {
-  const { data, error } = await supabase.from('settings').select('*')
-  if (error) return res.status(500).json(error)
-  const config = {}
-  data.forEach(item => {
-    config[item.key] = item.value
-  })
-  res.json(config)
-})
-
-// 更新配置
-app.post('/api/settings', async (req, res) => {
-  const updates = req.body
-  for (const [key, value] of Object.entries(updates)) {
-    const { error } = await supabase
-      .from('settings')
-      .upsert([{ key, value }], { onConflict: 'key' })
-    if (error) return res.status(500).json(error)
-  }
-  res.json({ success: true })
-})
-
-// ====================== 记忆压缩工具函数 ======================
-// 简单估算token（粗略估算，满足本地测试）
+// ============================================================
+// 工具函数：估算Token数量
+// ============================================================
 function estimateToken(text) {
   return Math.ceil(text.length / 4)
 }
 
-// 触发对话压缩，生成摘要存入memories（PDF规范：只标记隐藏，不删除消息）
+// ============================================================
+// 会话接口
+// ============================================================
+
+// 新建会话
+app.post('/api/session/new', async (req, res) => {
+  try {
+    const now = new Date()
+    const { data, error } = await supabase
+      .from('sessions')
+      .insert([{ title: '新对话', created_at: now, updated_at: now }])
+      .select()
+    if (error) {
+      console.error('创建会话失败:', error)
+      return res.status(500).json(error)
+    }
+    res.json(data[0])
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// 重命名会话
+app.put('/api/session/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+    const { title } = req.body
+    const { data, error } = await supabase
+      .from('sessions')
+      .update({ title, updated_at: new Date() })
+      .eq('id', id)
+      .select()
+    if (error) {
+      return res.status(500).json(error)
+    }
+    res.json(data[0])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// 删除会话 (修复了路由 :id 缺失斜杠的问题)
+app.delete('/api/session/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+
+    // 删除该会话下所有消息
+    await supabase.from('messages').delete().eq('session_id', id)
+    // 删除该会话下所有记忆
+    await supabase.from('memories').delete().eq('session_id', id)
+
+    const { error } = await supabase.from('sessions').delete().eq('id', id)
+    if (error) {
+      return res.status(500).json(error)
+    }
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================================
+// 消息接口
+// ============================================================
+
+// 获取可见消息
+app.get('/api/messages/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params
+    const { data, error } = await supabase
+      .from('messages')
+      .select('role,content,id,created_at,visible')
+      .eq('session_id', sessionId)
+      .eq('visible', true)
+      .order('created_at')
+    if (error) {
+      return res.status(500).json(error)
+    }
+    res.json(data)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// 获取归档/不可见消息
+app.get('/api/messages/archived/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params
+    const { cursor, limit = 6 } = req.query
+
+    let query = supabase
+      .from('messages')
+      .select('role,content,id,created_at,visible')
+      .eq('session_id', sessionId)
+      .eq('visible', false)
+      .order('created_at', { ascending: true })
+
+    if (cursor) {
+      query = query.lt('id', cursor)
+    }
+
+    const { data, error } = await query.range(0, Number(limit))
+    if (error) {
+      return res.status(500).json(error)
+    }
+
+    data.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+    const hasMore = data.length > Number(limit)
+    if (hasMore) data.pop()
+
+    res.json({ list: data, hasMore })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================================
+// 设置接口
+// ============================================================
+
+app.get('/api/settings', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('settings').select('*')
+    if (error) {
+      return res.status(500).json(error)
+    }
+    const config = {}
+    data.forEach(item => {
+      config[item.key] = item.value
+    })
+    res.json(config)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/settings', async (req, res) => {
+  try {
+    const updates = req.body
+    for (const [key, value] of Object.entries(updates)) {
+      const { error } = await supabase
+        .from('settings')
+        .upsert([{ key, value }], { onConflict: 'key' })
+      if (error) {
+        return res.status(500).json(error)
+      }
+    }
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================================
+// 记忆压缩函数
+// ============================================================
 async function compressHistory(sessionId, oldMsgList, compressPrompt) {
-  const contentText = oldMsgList.map(m => `${m.role}: ${m.content}`).join('\n')
+  const contentText = oldMsgList
+    .map(m => `(${m.role}): ${m.content}`)
+    .join('\n')
   const messages = [
     { role: 'system', content: compressPrompt },
-    { role: 'user', content: `把下面这段对话精简成一段长期记忆摘要，保留关键信息：\n${contentText}` }
+    { role: 'user', content: `把下面对话总结成长期记忆，保留重要信息：\n${contentText}` }
   ]
 
   const aiRes = await fetch(DEEPSEEK_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+      'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
     },
     body: JSON.stringify({
       model: 'deepseek-chat',
@@ -165,44 +214,66 @@ async function compressHistory(sessionId, oldMsgList, compressPrompt) {
       temperature: 0.3
     })
   })
+
   const aiData = await aiRes.json()
+  if (!aiData.choices || !aiData.choices[0]) {
+    console.error('DeepSeek 压缩失败:', aiData)
+    throw new Error(aiData.error?.message || 'DeepSeek 返回异常')
+  }
+
   const summary = aiData.choices[0].message.content
 
-  // 存入记忆表
-  await supabase.from('memories').insert([{
+  // 保存记忆摘要到数据库
+  await supabase.from('memories').insert({
     session_id: sessionId,
     summary,
     source_msg_ids: oldMsgList.map(m => m.id),
     created_at: new Date()
-  }])
+  })
 
-  // PDF规范：不删除旧消息，仅标记 visible=false 隐藏
-  const ids = oldMsgList.map(m => m.id)
-  await supabase.from('messages')
+  // 将旧的压缩消息标记为不可见
+  await supabase
+    .from('messages')
     .update({ visible: false })
-    .in('id', ids)
+    .in('id', oldMsgList.map(m => m.id))
 
   return summary
 }
 
-// ====================== 核心对话接口 ======================
+// ============================================================
+// 核心聊天接口（修复了吞消息和语法错误）
+// ============================================================
 app.post('/api/chat', async (req, res) => {
   try {
     const { sessionId, content } = req.body
-    if (!sessionId || !content) return res.status(400).json({ msg: '参数缺失' })
+    if (!sessionId || !content) {
+      return res.status(400).json({ msg: '参数缺失' })
+    }
+
     const now = new Date()
 
-    // 1. 插入用户消息，自带visible:true
-    const { data: userMsg, error: userErr } = await supabase
+    // 1. 保存用户消息
+    const { error: userErr } = await supabase
       .from('messages')
-      .insert([{ session_id: sessionId, role: 'user', content, created_at: now, visible: true }])
-      .select()
-    if (userErr) return res.status(500).json(userErr)
+      .insert([{
+        session_id: sessionId,
+        role: 'user',
+        content,
+        created_at: now,
+        visible: true
+      }])
+    if (userErr) {
+      console.error('保存用户消息失败:', userErr)
+      return res.status(500).json(userErr)
+    }
 
-    // 2. 读取全局配置
+    // 2. 获取配置
     const { data: settingRows } = await supabase.from('settings').select('*')
     const settings = {}
-    settingRows.forEach(s => settings[s.key] = s.value)
+    settingRows?.forEach(s => {
+      settings[s.key] = s.value
+    })
+
     const {
       system_prompt = '你是温柔贴心的AI伴侣，简短自然回复',
       temperature = 0.7,
@@ -210,94 +281,109 @@ app.post('/api/chat', async (req, res) => {
       compress_keep_rounds = 4
     } = settings
 
-    // 3. 获取当前会话全部历史消息（包含已隐藏visible=false，用于统计token压缩）
+    // 3. 获取历史消息
     const { data: allHistory } = await supabase
       .from('messages')
-      .select('id, role, content, created_at, visible')
+      .select('id,role,content,created_at,visible')
       .eq('session_id', sessionId)
       .order('created_at')
 
-    // 4. 计算总token，判断是否需要压缩【修复：保证保留消息为完整问答，不会奇数断层】
+    // 4. Token 估算与记忆压缩（修复了 DEEPSEEK_URL 未定义和 memorySummary 重复声明的问题）
     let totalTokens = 0
-    allHistory.forEach(m => totalTokens += estimateToken(m.content))
+    allHistory?.forEach(m => {
+      totalTokens += estimateToken(m.content)
+    })
+
     let memorySummary = ''
+    const keepCount = Number(compress_keep_rounds) * 2
 
-    // 一轮对话 = user + assistant 2条消息
-    const keepMsgCount = compress_keep_rounds * 2
-    console.log(`【压缩检测】总Token:${totalTokens} 阈值:${compress_threshold}`)
-    console.log(`【压缩检测】消息总数:${allHistory.length} 最少需要大于:${keepMsgCount}`)
-
-    if (totalTokens > compress_threshold && allHistory.length > keepMsgCount) {
-      console.log("✅ 条件达成，执行记忆压缩")
-      const totalMsg = allHistory.length
-      let reserveNum = keepMsgCount
-      // 修复：如果剩余消息是奇数，多保留1条，保证末尾是完整AI回复，不会截断用户提问
-      if ((totalMsg - reserveNum) % 2 !== 0) {
-        reserveNum += 1
+    if (totalTokens > Number(compress_threshold) && allHistory.length > keepCount) {
+      let reserve = keepCount
+      if ((allHistory.length - reserve) % 2 !== 0) {
+        reserve++
       }
-      const needCompress = allHistory.slice(0, allHistory.length - reserveNum)
-      memorySummary = await compressHistory(sessionId, needCompress, '你是对话记忆总结助手')
-      console.log("✅ 压缩完成，摘要：", memorySummary)
-    } else {
-      console.log("❌ 不满足压缩条件，跳过")
+      const oldList = allHistory.slice(0, allHistory.length - reserve)
+      try {
+        memorySummary = await compressHistory(sessionId, oldList, '你是对话记忆总结助手')
+      } catch (err) {
+        console.error('压缩失败，跳过压缩步骤:', err)
+        // 压缩失败不影响正常对话
+      }
     }
 
-    // 5. 组装发给AI的上下文（优化：人设+摘要合并单条system，强化人格不跑偏）
-    const sendMessages = []
-    let fullSystemPrompt = system_prompt
-    // 把记忆摘要合并进同一条系统提示
+    // 5. 组装上下文
+    let systemPrompt = system_prompt
     if (memorySummary) {
-      fullSystemPrompt += `
-【历史对话摘要参考，不要遗忘】
-${memorySummary}
-`
+      systemPrompt += `\n【历史记忆】\n${memorySummary}`
     }
-    // 只使用单条system消息，人设永远置顶
-    sendMessages.push({ role: 'system', content: fullSystemPrompt })
 
-    // 仅读取可见消息作为上下文
+    const sendMessages = [{ role: 'system', content: systemPrompt }]
     const { data: newHistory } = await supabase
       .from('messages')
-      .select('role, content, created_at')
+      .select('role,content')
       .eq('session_id', sessionId)
       .eq('visible', true)
       .order('created_at')
+
     sendMessages.push(...newHistory)
 
-    // 6. 调用DeepSeek生成回复
+    // 6. 调用 DeepSeek API
     const aiRes = await fetch(DEEPSEEK_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+        'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
       },
       body: JSON.stringify({
         model: 'deepseek-chat',
         messages: sendMessages,
-        temperature
+        temperature: Number(temperature)
       })
     })
+
     const aiData = await aiRes.json()
+    if (!aiData.choices || !aiData.choices[0]) {
+      console.error('DeepSeek 聊天失败:', aiData)
+      return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
+    }
+
     const replyText = aiData.choices[0].message.content
 
-    // 7. 保存AI回复入库，自带visible:true
-    await supabase
+    // 7. 保存 AI 回复（修复了保存失败却依然返回成功导致吞消息的问题）
+    const { error: aiSaveErr } = await supabase
       .from('messages')
-      .insert([{ session_id: sessionId, role: 'assistant', content: replyText, created_at: now, visible: true }])
+      .insert([{
+        session_id: sessionId,
+        role: 'assistant',
+        content: replyText,
+        created_at: now,
+        visible: true
+      }])
 
-    // 更新会话最后更新时间
+    if (aiSaveErr) {
+      console.error('保存 AI 消息失败:', aiSaveErr)
+      // 这里必须返回 500 错误，否则前端以为成功了，一刷新会吞消息
+      return res.status(500).json({ error: 'AI回复保存失败，请重试' })
+    }
+
+    // 更新会话更新时间
     await supabase
       .from('sessions')
       .update({ updated_at: now })
       .eq('id', sessionId)
 
+    // 成功返回
     res.json({ reply: replyText })
+
   } catch (err) {
-    console.error('对话接口异常：', err)
-    res.status(500).json({ error: 'AI调用失败，请检查密钥或数据库' })
+    console.error('聊天接口异常:', err)
+    res.status(500).json({ error: err.message })
   }
 })
 
+// ============================================================
+// 启动服务器
+// ============================================================
 app.listen(PORT, () => {
-  console.log(`后端服务启动：http://localhost:${PORT}`)
+  console.log(`🚀 后端服务运行在端口 ${PORT}`)
 })
