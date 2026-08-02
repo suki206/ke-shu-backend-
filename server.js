@@ -144,6 +144,29 @@ app.get('/api/messages/:sessionId', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+// ============================================================
+// 归档消息接口（被压缩隐藏的历史消息）
+// ============================================================
+app.get('/api/messages/archived/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params
+    const { data, error } = await supabase
+      .from('messages')
+      .select('role,content,id,created_at,visible')
+      .eq('session_id', sessionId)
+      .eq('visible', false)  // 只查被压缩隐藏的消息
+      .order('created_at', { ascending: true })
+    
+    if (error) {
+      console.error('获取归档消息失败:', error)
+      return res.status(500).json({ error: error.message })
+    }
+    res.json(data || [])
+  } catch (err) {
+    console.error('获取归档消息异常:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
 
 // ============================================================
 // 设置接口
