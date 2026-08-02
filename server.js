@@ -29,11 +29,25 @@ const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
 // 工具函数
 // ============================================================
 function estimateToken(text) {
-  return Math.ceil(text.length / 4)
+  if (!text) return 0
+  return Math.ceil(String(text).length / 4)
+}
+
+// 兼容两种 settings 表结构
+function parseSettings(settingRows) {
+  if (!settingRows || settingRows.length === 0) return {}
+  // 如果是 key-value 结构
+  if ('key' in settingRows[0]) {
+    const settings = {}
+    settingRows.forEach(s => { settings[s.key] = s.value })
+    return settings
+  }
+  // 如果是单行多字段结构（教程默认）
+  return settingRows[0]
 }
 
 // ============================================================
-// ================ 【新增接口】获取所有会话列表 ================
+// 会话管理接口
 // ============================================================
 app.get('/api/sessions', async (req, res) => {
   try {
@@ -42,27 +56,30 @@ app.get('/api/sessions', async (req, res) => {
       .select('*')
       .order('updated_at', { ascending: false })
     if (error) {
-      return res.status(500).json(error)
+      console.error('获取会话列表失败:', error)
+      return res.status(500).json({ error: error.message })
     }
     res.json(data || [])
   } catch (err) {
+    console.error('获取会话列表异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
 
-// ============================================================
-// 会话管理接口
-// ============================================================
 app.post('/api/session/new', async (req, res) => {
   try {
-    const now = new Date()
+    const now = new Date().toISOString()
     const { data, error } = await supabase
       .from('sessions')
       .insert([{ title: '新对话', created_at: now, updated_at: now }])
       .select()
-    if (error) return res.status(500).json(error)
+    if (error) {
+      console.error('新建会话失败:', error)
+      return res.status(500).json({ error: error.message })
+    }
     res.json(data[0])
   } catch (err) {
+    console.error('新建会话异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -71,14 +88,19 @@ app.put('/api/session/:id', async (req, res) => {
   try {
     const { id } = req.params
     const { title } = req.body
+    const now = new Date().toISOString()
     const { data, error } = await supabase
       .from('sessions')
-      .update({ title, updated_at: new Date() })
+      .update({ title, updated_at: now })
       .eq('id', id)
       .select()
-    if (error) return res.status(500).json(error)
+    if (error) {
+      console.error('更新会话失败:', error)
+      return res.status(500).json({ error: error.message })
+    }
     res.json(data[0])
   } catch (err) {
+    console.error('更新会话异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -89,9 +111,13 @@ app.delete('/api/session/:id', async (req, res) => {
     await supabase.from('messages').delete().eq('session_id', id)
     await supabase.from('memories').delete().eq('session_id', id)
     const { error } = await supabase.from('sessions').delete().eq('id', id)
-    if (error) return res.status(500).json(error)
+    if (error) {
+      console.error('删除会话失败:', error)
+      return res.status(500).json({ error: error.message })
+    }
     res.json({ success: true })
   } catch (err) {
+    console.error('删除会话异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -107,32 +133,14 @@ app.get('/api/messages/:sessionId', async (req, res) => {
       .select('role,content,id,created_at,visible')
       .eq('session_id', sessionId)
       .eq('visible', true)
-      .order('created_at')
-    if (error) return res.status(500).json(error)
-    res.json(data)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.get('/api/messages/archived/:sessionId', async (req, res) => {
-  try {
-    const { sessionId } = req.params
-    const { cursor, limit = 6 } = req.query
-    let query = supabase
-      .from('messages')
-      .select('role,content,id,created_at,visible')
-      .eq('session_id', sessionId)
-      .eq('visible', false)
       .order('created_at', { ascending: true })
-    if (cursor) query = query.lt('id', cursor)
-    const { data, error } = await query.range(0, Number(limit))
-    if (error) return res.status(500).json(error)
-    data.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-    const hasMore = data.length > Number(limit)
-    if (hasMore) data.pop()
-    res.json({ list: data, hasMore })
+    if (error) {
+      console.error('获取消息失败:', error)
+      return res.status(500).json({ error: error.message })
+    }
+    res.json(data || [])
   } catch (err) {
+    console.error('获取消息异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -143,11 +151,14 @@ app.get('/api/messages/archived/:sessionId', async (req, res) => {
 app.get('/api/settings', async (req, res) => {
   try {
     const { data, error } = await supabase.from('settings').select('*')
-    if (error) return res.status(500).json(error)
-    const config = {}
-    data.forEach(item => { config[item.key] = item.value })
+    if (error) {
+      console.error('获取设置失败:', error)
+      return res.status(500).json({ error: error.message })
+    }
+    const config = parseSettings(data)
     res.json(config)
   } catch (err) {
+    console.error('获取设置异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -155,14 +166,26 @@ app.get('/api/settings', async (req, res) => {
 app.post('/api/settings', async (req, res) => {
   try {
     const updates = req.body
+    // 兼容 key-value 结构
     for (const [key, value] of Object.entries(updates)) {
       const { error } = await supabase
         .from('settings')
         .upsert([{ key, value }], { onConflict: 'key' })
-      if (error) return res.status(500).json(error)
+      if (error) {
+        // 如果 key-value 结构失败，尝试直接更新单行
+        const { error: updateErr } = await supabase
+          .from('settings')
+          .update({ [key]: value })
+          .eq('id', 1)
+        if (updateErr) {
+          console.error('保存设置失败:', error, updateErr)
+          return res.status(500).json({ error: error.message })
+        }
+      }
     }
     res.json({ success: true })
   } catch (err) {
+    console.error('保存设置异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -189,12 +212,11 @@ async function compressHistory(sessionId, oldMsgList, compressPrompt) {
     throw new Error(aiData.error?.message || 'DeepSeek 返回异常')
   }
   const summary = aiData.choices[0].message.content
-  await supabase.from('memories').insert({
+  await supabase.from('memories').insert([{
     session_id: sessionId,
     summary,
-    source_msg_ids: oldMsgList.map(m => m.id),
-    created_at: new Date()
-  })
+    created_at: new Date().toISOString()
+  }])
   await supabase
     .from('messages')
     .update({ visible: false })
@@ -208,17 +230,32 @@ async function compressHistory(sessionId, oldMsgList, compressPrompt) {
 app.post('/api/chat', async (req, res) => {
   try {
     const { sessionId, content } = req.body
-    if (!sessionId || !content) return res.status(400).json({ msg: '参数缺失' })
-    const now = new Date()
-    
+    if (!sessionId || !content) {
+      return res.status(400).json({ error: '参数缺失：需要 sessionId 和 content' })
+    }
+
+    // 1. 保存用户消息（使用当前时间）
+    const userNow = new Date().toISOString()
     const { error: userErr } = await supabase
       .from('messages')
-      .insert([{ session_id: sessionId, role: 'user', content, created_at: now, visible: true }])
-    if (userErr) return res.status(500).json(userErr)
+      .insert([{
+        session_id: sessionId,
+        role: 'user',
+        content,
+        created_at: userNow,
+        visible: true
+      }])
+    if (userErr) {
+      console.error('保存用户消息失败:', userErr)
+      return res.status(500).json({ error: '保存用户消息失败: ' + userErr.message })
+    }
 
-    const { data: settingRows } = await supabase.from('settings').select('*')
-    const settings = {}
-    settingRows?.forEach(s => { settings[s.key] = s.value })
+    // 2. 读取设置
+    const { data: settingRows, error: settingsErr } = await supabase.from('settings').select('*')
+    if (settingsErr) {
+      console.error('读取设置失败:', settingsErr)
+    }
+    const settings = parseSettings(settingRows)
     const {
       system_prompt = '你是温柔贴心的AI伴侣，简短自然回复',
       temperature = 0.7,
@@ -226,12 +263,17 @@ app.post('/api/chat', async (req, res) => {
       compress_keep_rounds = 4
     } = settings
 
-    const { data: allHistory } = await supabase
+    // 3. 读取完整历史用于 token 估算
+    const { data: allHistory, error: histErr } = await supabase
       .from('messages')
       .select('id,role,content,created_at,visible')
       .eq('session_id', sessionId)
-      .order('created_at')
+      .order('created_at', { ascending: true })
+    if (histErr) {
+      console.error('读取历史失败:', histErr)
+    }
 
+    // 4. 检查是否需要压缩
     let totalTokens = 0
     allHistory?.forEach(m => { totalTokens += estimateToken(m.content) })
     let memorySummary = ''
@@ -242,21 +284,43 @@ app.post('/api/chat', async (req, res) => {
       const oldList = allHistory.slice(0, allHistory.length - reserve)
       try {
         memorySummary = await compressHistory(sessionId, oldList, '你是对话记忆总结助手')
-      } catch (err) { console.error('压缩失败，跳过', err) }
+        console.log('记忆压缩完成:', memorySummary.substring(0, 50) + '...')
+      } catch (err) {
+        console.error('压缩失败，跳过:', err.message)
+      }
     }
 
+    // 5. 组装系统提示词
     let systemPrompt = system_prompt
-    if (memorySummary) systemPrompt += `\n【历史记忆】\n${memorySummary}`
+    if (memorySummary) {
+      systemPrompt += `\n【历史记忆】\n${memorySummary}`
+    }
 
-    const sendMessages = [{ role: 'system', content: systemPrompt }]
-    const { data: newHistory } = await supabase
+    // 6. 读取可见历史消息（用于发送给模型）
+    const { data: newHistory, error: visibleErr } = await supabase
       .from('messages')
       .select('role,content')
       .eq('session_id', sessionId)
       .eq('visible', true)
-      .order('created_at')
-    sendMessages.push(...newHistory)
+      .order('created_at', { ascending: true })
+    if (visibleErr) {
+      console.error('读取可见消息失败:', visibleErr)
+    }
 
+    // 7. 构建消息数组（清洗字段，确保顺序正确）
+    const sendMessages = [{ role: 'system', content: systemPrompt }]
+    if (newHistory && newHistory.length > 0) {
+      // 过滤掉 content 为 null 的，只保留 API 需要的字段
+      const cleanHistory = newHistory
+        .filter(m => m.content != null)
+        .map(m => ({ role: m.role, content: String(m.content) }))
+      sendMessages.push(...cleanHistory)
+    }
+
+    console.log('发送给模型的消息数:', sendMessages.length)
+    console.log('最后一条角色:', sendMessages[sendMessages.length - 1]?.role)
+
+    // 8. 调用主模型
     const aiRes = await fetch(DEEPSEEK_URL, {
       method: 'POST',
       headers: {
@@ -270,15 +334,31 @@ app.post('/api/chat', async (req, res) => {
       })
     })
     const aiData = await aiRes.json()
-    if (!aiData.choices || !aiData.choices[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
+    if (!aiData.choices || !aiData.choices[0]) {
+      console.error('AI 返回异常:', aiData)
+      return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
+    }
     const replyText = aiData.choices[0].message.content
 
+    // 9. 保存 AI 回复（使用新的时间戳，确保与用户消息有时间差）
+    const aiNow = new Date().toISOString()
     const { error: aiSaveErr } = await supabase
       .from('messages')
-      .insert([{ session_id: sessionId, role: 'assistant', content: replyText, created_at: now, visible: true }])
-    if (aiSaveErr) return res.status(500).json({ error: 'AI回复保存失败' })
+      .insert([{
+        session_id: sessionId,
+        role: 'assistant',
+        content: replyText,
+        created_at: aiNow,
+        visible: true
+      }])
+    if (aiSaveErr) {
+      console.error('保存AI回复失败:', aiSaveErr)
+      return res.status(500).json({ error: 'AI回复保存失败: ' + aiSaveErr.message })
+    }
 
-    await supabase.from('sessions').update({ updated_at: now }).eq('id', sessionId)
+    // 10. 更新会话时间
+    await supabase.from('sessions').update({ updated_at: aiNow }).eq('id', sessionId)
+
     res.json({ reply: replyText })
   } catch (err) {
     console.error('聊天异常:', err)
