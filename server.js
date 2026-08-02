@@ -150,18 +150,40 @@ app.get('/api/messages/:sessionId', async (req, res) => {
 app.get('/api/messages/archived/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params
-    const { data, error } = await supabase
+    const limit = parseInt(req.query.limit) || 100
+    const cursor = req.query.cursor
+    
+    let query = supabase
       .from('messages')
       .select('role,content,id,created_at,visible')
       .eq('session_id', sessionId)
-      .eq('visible', false)  // 只查被压缩隐藏的消息
+      .eq('visible', false)
       .order('created_at', { ascending: true })
+    
+    // 如果传了 cursor，加载比该消息更早的
+    if (cursor) {
+      const { data: cursorData, error: cursorErr } = await supabase
+        .from('messages')
+        .select('created_at')
+        .eq('id', cursor)
+        .single()
+      
+      if (!cursorErr && cursorData) {
+        query = query.lt('created_at', cursorData.created_at)
+      }
+    }
+    
+    const { data, error } = await query.limit(limit + 1)
     
     if (error) {
       console.error('获取归档消息失败:', error)
       return res.status(500).json({ error: error.message })
     }
-    res.json(data || [])
+    
+    const hasMore = data.length > limit
+    const list = hasMore ? data.slice(0, limit) : data
+    
+    res.json({ list: list || [], hasMore })
   } catch (err) {
     console.error('获取归档消息异常:', err)
     res.status(500).json({ error: err.message })
