@@ -385,9 +385,9 @@ app.post('/api/chat', async (req, res) => {
     }
     const replyText = aiData.choices[0].message.content
 
-    // 9. 保存 AI 回复（使用新的时间戳，确保与用户消息有时间差）
+       // 9. 保存 AI 回复（使用新的时间戳，确保与用户消息有时间差）
     const aiNow = new Date().toISOString()
-    const { error: aiSaveErr } = await supabase
+    const { data: savedMsg, error: aiSaveErr } = await supabase
       .from('messages')
       .insert([{
         session_id: sessionId,
@@ -396,6 +396,7 @@ app.post('/api/chat', async (req, res) => {
         created_at: aiNow,
         visible: true
       }])
+      .select()
     if (aiSaveErr) {
       console.error('保存AI回复失败:', aiSaveErr)
       return res.status(500).json({ error: 'AI回复保存失败: ' + aiSaveErr.message })
@@ -404,9 +405,120 @@ app.post('/api/chat', async (req, res) => {
     // 10. 更新会话时间
     await supabase.from('sessions').update({ updated_at: aiNow }).eq('id', sessionId)
 
-    res.json({ reply: replyText })
+    // 11. 自动标题生成（如果标题还是"新对话"且已有2条以上消息）
+    let autoTitle = null
+    try {
+      const { data: sessionInfo } = await supabase.from('sessions').select('title').eq('id', sessionId).single()
+      const { count } = await supabase.from('messages').select('*', { count: 'exact', head: true }).eq('session_id', sessionId).eq('visible', true)
+      if (sessionInfo?.title === '新对话' && count >= 2) {
+        const titleRes = await fetch(DEEPSEEK_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [
+              { role: 'system', content: '你是一个标题生成助手。根据对话内容，生成一个简短的标题（不超过10个字），直接返回标题文字，不要加引号或其他符号。' },
+              { role: 'user', content: `用户说：${content}\nAI回复：${replyText}\n请生成标题：` }
+            ],
+            temperature: 0.5,
+            max_tokens: 20
+          })
+        })
+        const titleData = await titleRes.json()
+        const generatedTitle = titleData.choices?.[0]?.message?.content?.trim().slice(0, 20)
+        if (generatedTitle) {
+          await supabase.from('sessions').update({ title: generatedTitle, updated_at: aiNow }).eq('id', sessionId)
+          autoTitle = generatedTitle
+        }
+      }
+    } catch (e) { console.error('自动标题生成失败:', e.message) }
+
+    res.json({ reply: replyText, messageId: savedMsg?.[0]?.id, autoTitle })
   } catch (err) {
     console.error('聊天异常:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================================
+// 重新生成接口
+// ============================================================
+app.post('/api/chat/regenerate', async (req, res) => {
+  try {
+    const { sessionId } = req.body
+    if (!sessionId) return res.status(400).json({ error: '参数缺失：需要 sessionId' })
+
+    // 1. 读取设置
+    const { data: settingRows, error: settingsErr } = await supabase.from('settings').select('*')
+    if (settingsErr) console.error('读取设置失败:', settingsErr)
+    const settings = parseSettings(settingRows)
+    const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7 } = settings
+
+    // 2. 获取该会话所有可见消息
+    const { data: allMessages, error: msgErr } = await supabase
+      .from('messages')
+      .select('id,role,content,created_at')
+      .eq('session_id', sessionId)
+      .eq('visible', true)
+      .order('created_at', { ascending: true })
+    
+    if (msgErr || !allMessages || allMessages.length === 0) {
+      return res.status(400).json({ error: '没有可重新生成的消息' })
+    }
+
+    // 3. 找到最后一条AI消息
+    const lastMsg = allMessages[allMessages.length - 1]
+    if (lastMsg.role !== 'assistant') {
+      return res.status(400).json({ error: '最后一条消息不是AI回复' })
+    }
+
+    // 4. 构建上下文（不包含最后一条AI消息）
+    const contextMessages = allMessages.slice(0, -1)
+    const sendMessages = [{ role: 'system', content: system_prompt }]
+    const cleanHistory = contextMessages
+      .filter(m => m.content != null)
+      .map(m => ({ role: m.role, content: String(m.content) }))
+    sendMessages.push(...cleanHistory)
+
+    // 5. 调用AI重新生成
+    const aiRes = await fetch(DEEPSEEK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: sendMessages,
+        temperature: Number(temperature)
+      })
+    })
+    const aiData = await aiRes.json()
+    if (!aiData.choices || !aiData.choices[0]) {
+      return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
+    }
+    const replyText = aiData.choices[0].message.content
+
+    // 6. 更新最后一条AI消息的内容
+    const now = new Date().toISOString()
+    const { error: updateErr } = await supabase
+      .from('messages')
+      .update({ content: replyText, created_at: now })
+      .eq('id', lastMsg.id)
+    
+    if (updateErr) {
+      return res.status(500).json({ error: '更新消息失败: ' + updateErr.message })
+    }
+
+    // 7. 更新会话时间
+    await supabase.from('sessions').update({ updated_at: now }).eq('id', sessionId)
+
+    res.json({ reply: replyText })
+  } catch (err) {
+    console.error('重新生成异常:', err)
     res.status(500).json({ error: err.message })
   }
 })
