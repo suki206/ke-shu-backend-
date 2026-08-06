@@ -549,7 +549,7 @@ app.post('/api/chat', async (req, res) => {
       if (worthIt) {
         const holdResult = await callOmbreTool('hold', {
           content: `用户说：${content}\n\n你回复：${replyText}`,
-          tags: `对话,${sessionId}`,
+          tags: ['对话', sessionId],
           importance: 5
         })
         console.log('🧠 记忆已存储:', holdResult)
