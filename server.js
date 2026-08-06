@@ -474,7 +474,7 @@ app.post('/api/chat', async (req, res) => {
         // 5.5 从 Ombre Brain 检索相关记忆
     let ombreMemory = ''
     try {
-      const memories = await callOmbreTool('breath', { query: content, max_results: 8 })
+      const memories = await callOmbreTool('breath', { query: content, max_results: 8, template: 'natural' })
       if (memories) {
         ombreMemory = `\n\n[你想起的相关记忆]\n${memories}\n[记忆结束]`
         console.log('🧠 检索到记忆:', memories.substring(0, 100) + '...')
@@ -549,7 +549,7 @@ app.post('/api/chat', async (req, res) => {
       if (worthIt) {
         const holdResult = await callOmbreTool('hold', {
           content: `用户说：${content}\n\n你回复：${replyText}`,
-          tags: ['对话', sessionId],
+          tags: `对话,${sessionId}`,
           importance: 5
         })
         console.log('🧠 记忆已存储:', holdResult)
