@@ -474,10 +474,39 @@ app.post('/api/chat', async (req, res) => {
         // 5.5 从 Ombre Brain 检索相关记忆
     let ombreMemory = ''
     try {
-      const memories = await callOmbreTool('breath', { query: content, max_results: 8 })
-      if (memories) {
-        ombreMemory = `\n\n[你想起的相关记忆]\n${memories}\n[记忆结束]`
-        console.log('🧠 检索到记忆:', memories.substring(0, 100) + '...')
+      // 第1步：breath 拿到 bucket_id 列表
+      const breathResult = await callOmbreTool('breath', { query: content, max_results: 8 })
+      console.log('🧠 breath raw:', breathResult?.substring(0, 200))
+      
+      // 解析 bucket_id
+      const bucketIds = []
+      if (breathResult) {
+        const regex = /bucket_id:([a-f0-9]+)/g
+        let match
+        while ((match = regex.exec(breathResult)) !== null) {
+          if (!bucketIds.includes(match[1])) bucketIds.push(match[1])
+        }
+      }
+      
+      // 第2步：用 trace 读取每个 bucket 的实际内容
+      const contents = []
+      for (const bucketId of bucketIds.slice(0, 3)) {
+        try {
+          const traceResult = await callOmbreTool('trace', { 
+            action: 'read', 
+            bucket_id: bucketId 
+          })
+          if (traceResult && traceResult.length > 5) {
+            contents.push(traceResult)
+          }
+        } catch (e) {
+          console.error(`trace 读取失败 ${bucketId}:`, e.message)
+        }
+      }
+      
+      if (contents.length > 0) {
+        ombreMemory = `\n\n[你想起的相关记忆]\n${contents.join('\n---\n')}\n[记忆结束]`
+        console.log('🧠 检索到记忆:', ombreMemory.substring(0, 200) + '...')
       }
     } catch (e) { console.error('记忆检索失败:', e.message) }
     if (ombreMemory) systemPrompt += ombreMemory
