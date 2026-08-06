@@ -493,7 +493,6 @@ app.post('/api/chat', async (req, res) => {
       for (const bucketId of bucketIds.slice(0, 3)) {
         try {
           const traceResult = await callOmbreTool('trace', { 
-            action: 'read', 
             bucket_id: bucketId 
           })
           if (traceResult && traceResult.length > 5) {
