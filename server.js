@@ -4,6 +4,104 @@ const cors = require('cors')
 const { createClient } = require('@supabase/supabase-js')
 const fetch = require('node-fetch')
 
+// ===== Ombre Brain MCP 客户端 =====
+const OMBRE_BRAIN_URL = process.env.OMBRE_BRAIN_URL || '';
+const OMBRE_MCP_TOKEN = process.env.OMBRE_MCP_TOKEN || '';
+let ombreSessionId = null;
+let ombreCallId = 0;
+
+function parseSSEResponse(text) {
+  const lines = text.split('\n');
+  for (const line of lines) {
+    if (line.startsWith('data:')) {
+      try { return JSON.parse(line.substring(5)); } catch (e) {}
+    }
+  }
+  try { return JSON.parse(text); } catch (e) { return null; }
+}
+
+async function initOmbreSession() {
+  if (!OMBRE_BRAIN_URL) return false;
+  try {
+    const response = await fetch(`${OMBRE_BRAIN_URL}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json,text/event-stream',
+        'Authorization': `Bearer ${OMBRE_MCP_TOKEN}`
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "ke-shu-backend", version: "1.0" }
+        },
+        id: ++ombreCallId
+      })
+    });
+    ombreSessionId = response.headers.get('mcp-session-id');
+    await fetch(`${OMBRE_BRAIN_URL}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json,text/event-stream',
+        'Mcp-Session-Id': ombreSessionId,
+        'Authorization': `Bearer ${OMBRE_MCP_TOKEN}`
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
+      })
+    });
+    console.log('🧠 Ombre Brain 已连接:', OMBRE_BRAIN_URL);
+    return true;
+  } catch (err) {
+    console.error('MCP 会话初始化失败:', err.message);
+    ombreSessionId = null;
+    return false;
+  }
+}
+
+async function callOmbreTool(toolName, args = {}) {
+  if (!OMBRE_BRAIN_URL) return null;
+  try {
+    if (!ombreSessionId) {
+      const ok = await initOmbreSession();
+      if (!ok) return null;
+    }
+    const response = await fetch(`${OMBRE_BRAIN_URL}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json,text/event-stream',
+        'Mcp-Session-Id': ombreSessionId,
+        'Authorization': `Bearer ${OMBRE_MCP_TOKEN}`
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: { name: toolName, arguments: args },
+        id: ++ombreCallId
+      })
+    });
+    const text = await response.text();
+    const parsed = parseSSEResponse(text);
+    if (parsed?.result?.content) {
+      return parsed.result.content
+        .filter(c => c.type === 'text')
+        .map(c => c.text)
+        .join('\n');
+    }
+    return parsed?.result ? parsed.result : null;
+  } catch (err) {
+    console.error(`MCP 工具 ${toolName} 调用失败:`, err.message);
+    ombreSessionId = null;
+    return null;
+  }
+}
+
 const app = express()
 const PORT = process.env.PORT || 3000
 
@@ -17,6 +115,8 @@ console.log('=============== 环境检查 ===============')
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '已读取' : '缺失')
 console.log('SUPABASE_KEY:', process.env.SUPABASE_ANON_KEY ? '已读取' : '缺失')
 console.log('DEEPSEEK_API_KEY:', process.env.DEEPSEEK_API_KEY ? '已读取' : '缺失')
+console.log('OMBRE_BRAIN_URL:', process.env.OMBRE_BRAIN_URL ? '已读取' : '缺失')
+console.log('OMBRE_MCP_TOKEN:', process.env.OMBRE_MCP_TOKEN ? '已读取' : '缺失')
 console.log('========================================')
 
 const supabase = createClient(
@@ -341,6 +441,17 @@ app.post('/api/chat', async (req, res) => {
       systemPrompt += `\n【历史记忆】\n${memorySummary}`
     }
 
+        // 5.5 从 Ombre Brain 检索相关记忆
+    let ombreMemory = ''
+    try {
+      const memories = await callOmbreTool('breath', { query: content, max_results: 3 })
+      if (memories) {
+        ombreMemory = `\n\n[你想起的相关记忆]\n${memories}\n[记忆结束]`
+        console.log('🧠 检索到记忆:', memories.substring(0, 100) + '...')
+      }
+    } catch (e) { console.error('记忆检索失败:', e.message) }
+    if (ombreMemory) systemPrompt += ombreMemory
+
     // 6. 读取可见历史消息（用于发送给模型）
     const { data: newHistory, error: visibleErr } = await supabase
       .from('messages')
@@ -401,6 +512,16 @@ app.post('/api/chat', async (req, res) => {
       console.error('保存AI回复失败:', aiSaveErr)
       return res.status(500).json({ error: 'AI回复保存失败: ' + aiSaveErr.message })
     }
+
+    // 9.5 存储到 Ombre Brain
+    try {
+      await callOmbreTool('hold', {
+        content: `用户说：${content}\n\n你回复：${replyText}`,
+        tags: `对话,${sessionId}`,
+        importance: 5
+      })
+      console.log('🧠 记忆已存储')
+    } catch (e) { console.error('记忆存储失败:', e.message) }
 
     // 10. 更新会话时间
     await supabase.from('sessions').update({ updated_at: aiNow }).eq('id', sessionId)
