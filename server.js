@@ -87,6 +87,7 @@ async function callOmbreTool(toolName, args = {}) {
       })
     });
     const text = await response.text();
+    console.log(`MCP ${toolName} raw:`, text.substring(0, 300));
     const parsed = parseSSEResponse(text);
     if (parsed?.result?.content) {
       return parsed.result.content
@@ -515,12 +516,12 @@ app.post('/api/chat', async (req, res) => {
 
     // 9.5 存储到 Ombre Brain
     try {
-      await callOmbreTool('hold', {
+      const holdResult = await callOmbreTool('hold', {
         content: `用户说：${content}\n\n你回复：${replyText}`,
-        tags: `对话,${sessionId}`,
+        tags: ['对话', sessionId],
         importance: 5
       })
-      console.log('🧠 记忆已存储')
+      console.log('🧠 记忆已存储:', holdResult)
     } catch (e) { console.error('记忆存储失败:', e.message) }
 
     // 10. 更新会话时间
