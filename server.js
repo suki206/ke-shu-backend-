@@ -103,6 +103,35 @@ async function callOmbreTool(toolName, args = {}) {
   }
 }
 
+// ===== 判断对话是否值得记住 =====
+async function shouldRemember(content, replyText) {
+  try {
+    const judgePrompt = `判断以下对话是否包含值得长期记住的信息（如个人喜好、身份、计划、重要事件、情绪状态）。只回复"是"或"否"，不要解释。
+用户：${content}
+AI：${replyText}`;
+
+    const response = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: judgePrompt }],
+        max_tokens: 2,
+        temperature: 0
+      })
+    });
+    const data = await response.json();
+    const answer = data.choices?.[0]?.message?.content || '';
+    return answer.includes('是');
+  } catch (e) {
+    console.error('记忆判断失败:', e.message);
+    return true;
+  }
+}
+
 const app = express()
 const PORT = process.env.PORT || 3000
 
@@ -514,14 +543,19 @@ app.post('/api/chat', async (req, res) => {
       return res.status(500).json({ error: 'AI回复保存失败: ' + aiSaveErr.message })
     }
 
-    // 9.5 存储到 Ombre Brain
+    // 9.5 存储到 Ombre Brain（AI 自主判断）
     try {
-      const holdResult = await callOmbreTool('hold', {
-        content: `用户说：${content}\n\n你回复：${replyText}`,
-        tags: `对话,${sessionId}`,
-        importance: 5
-      })
-      console.log('🧠 记忆已存储:', holdResult)
+      const worthIt = await shouldRemember(content, replyText);
+      if (worthIt) {
+        const holdResult = await callOmbreTool('hold', {
+          content: `用户说：${content}\n\n你回复：${replyText}`,
+          tags: `对话,${sessionId}`,
+          importance: 5
+        })
+        console.log('🧠 记忆已存储:', holdResult)
+      } else {
+        console.log('🧠 判断为不重要，跳过存储')
+      }
     } catch (e) { console.error('记忆存储失败:', e.message) }
 
     // 10. 更新会话时间
