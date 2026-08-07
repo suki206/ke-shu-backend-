@@ -472,66 +472,30 @@ app.post('/api/chat', async (req, res) => {
     }
 
         // 5.5 从 Ombre Brain 检索相关记忆
-    let ombreMemory = ''
-    try {
-      // 第1步：breath 拿到 bucket_id 列表
-      const breathResult = await callOmbreTool('breath', { query: content, max_results: 8 })
-      console.log('🧠 breath raw:', breathResult?.substring(0, 200))
-      
-      // 解析 bucket_id
-      const bucketIds = []
-      if (breathResult) {
-        const regex = /bucket_id:([a-f0-9]+)/g
-        let match
-        while ((match = regex.exec(breathResult)) !== null) {
-          if (!bucketIds.includes(match[1])) bucketIds.push(match[1])
-        }
-      }
-      
-      // 第2步：先 bucket_read 获取标题，再 source_read 读取内容
-      const contents = []
-      for (const bucketId of bucketIds.slice(0, 3)) {
-        try {
-          // 先获取桶信息（包含标题）
-          const bucketInfo = await callOmbreTool('bucket_read', { bucket_id: bucketId })
-          console.log(`📖 bucket_read (${bucketId}):`, bucketInfo?.substring(0, 200))
-          
-          // 提取标题
-          let title = ''
-          try {
-            const info = JSON.parse(bucketInfo)
-            title = info.title || info.name || ''
-          } catch {
-            // 如果不是 JSON，尝试从文本中提取
-            const match = bucketInfo?.match(/title["']?\s*[:=]\s*["']?([^"'\n]+)/)
-            if (match) title = match[1].trim()
-          }
-          
-          if (!title) {
-            console.log(`⚠️ 无法获取标题 ${bucketId}，跳过`)
-            continue
-          }
-          
-          // 再用 source_read 读取实际内容
-          const sourceResult = await callOmbreTool('source_read', { 
-            bucket_id: bucketId,
-            expected_title: title
-          })
-          console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 200))
-          if (sourceResult && sourceResult.length > 5 && !sourceResult.includes('Error')) {
-            contents.push(sourceResult)
-          }
-        } catch (e) {
-          console.error(`读取失败 ${bucketId}:`, e.message)
-        }
-      }
-      
-      if (contents.length > 0) {
-        ombreMemory = `\n\n[你想起的相关记忆]\n${contents.join('\n---\n')}\n[记忆结束]`
-        console.log('🧠 检索到记忆:', ombreMemory.substring(0, 200) + '...')
-      }
-    } catch (e) { console.error('记忆检索失败:', e.message) }
-    if (ombreMemory) systemPrompt += ombreMemory
+let ombreMemory = ''
+try {
+  // 用 breath_search 按用户当前消息搜索相关记忆（不是 breath，也不是 bucket_read）
+  const breathResult = await callOmbreTool('breath_search', { 
+    query: content, 
+    max_results: 5 
+  })
+  console.log('🧠 breath_search 结果:', breathResult?.substring(0, 300))
+  
+  if (breathResult && breathResult.length > 10 && !breathResult.includes('Error') && !breathResult.includes('Unknown tool')) {
+    ombreMemory = `\n\n[你想起的相关记忆]\n${breathResult}\n[记忆结束]`
+    console.log('🧠 注入记忆上下文:', ombreMemory.substring(0, 200) + '...')
+  } else {
+    // breath_search 没搜到东西时，尝试无参数 breath 获取浮现记忆
+    const surfacingResult = await callOmbreTool('breath', {})
+    if (surfacingResult && surfacingResult.length > 10 && !surfacingResult.includes('Error')) {
+      ombreMemory = `\n\n[你想起的记忆]\n${surfacingResult}\n[记忆结束]`
+      console.log('🧠 浮现记忆:', ombreMemory.substring(0, 200) + '...')
+    }
+  }
+} catch (e) { 
+  console.error('记忆检索失败:', e.message) 
+}
+if (ombreMemory) systemPrompt += ombreMemory
 
     // 6. 读取可见历史消息（用于发送给模型）
     const { data: newHistory, error: visibleErr } = await supabase
