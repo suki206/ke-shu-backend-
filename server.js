@@ -474,17 +474,48 @@ app.post('/api/chat', async (req, res) => {
       systemPrompt += `\n【历史记忆】\n${memorySummary}`
     }
 
+// 清洗 breath 返回的原始文本：去掉 [bucket_id:...] [payload_sha256:...] Footprint:... 等
+// 对模型毫无意义、纯粹浪费 token 的元数据标记，只留下"用户说/你回复"这种真正的正文，
+// 并按正文内容去重（同一件事的多条相似记忆只保留一条，省 token）。
+function cleanBreathMemory(raw) {
+  if (!raw) return ''
+  // 按 \n---\n 或独立的 [bucket_id:xxx] 行切分出每条记忆
+  const chunks = raw.split(/\n?---\n?|\[bucket_id:[a-f0-9]+\]/).map(s => s.trim()).filter(Boolean)
+
+  const seen = new Set()
+  const cleaned = []
+  for (let chunk of chunks) {
+    // 去掉所有中括号元数据标记，如 [content_role:xxx] [instructions:false] [payload_chars:73] 等
+    chunk = chunk.replace(/\[[a-z_]+:[^\]]*\]/gi, '').trim()
+    // 去掉 Footprint 溯源行（对当前对话没用）
+    chunk = chunk.replace(/Footprint[:：][^\n]*/g, '').trim()
+    // 去掉多余空行
+    chunk = chunk.replace(/\n{2,}/g, '\n').trim()
+    if (!chunk || chunk.length < 4) continue
+
+    // 用"用户说"后面那句话去重（火锅类高度相似的记忆只保留第一条）
+    const dedupeKey = chunk.slice(0, 30)
+    if (seen.has(dedupeKey)) continue
+    seen.add(dedupeKey)
+    cleaned.push(chunk)
+  }
+  return cleaned.join('\n---\n')
+}
+
         // 5.5 从 Ombre Brain 检索相关记忆
     // 说明：breath 本身返回的就是记忆正文（官方12个工具里没有 source_read 这个工具，
     // 之前的二次读取逻辑一直在调一个不存在的工具，导致记忆永远检索不到），直接用即可。
+    // max_results 调大一些，避免高度相似的记忆（如反复出现的"火锅"）把检索名额占满，
+    // 挤掉真正相关但只出现过一次的记忆（如"西瓜"）。
     let ombreMemory = ''
     try {
-      const breathResult = await callOmbreTool('breath', { query: content, max_results: 8 })
-      console.log('🧠 breath raw:', breathResult?.substring(0, 300))
+      const breathResult = await callOmbreTool('breath', { query: content, max_results: 20 })
+      const cleanedMemory = cleanBreathMemory(breathResult)
+      console.log('🧠 breath 清洗后:', cleanedMemory?.substring(0, 500))
 
-      if (breathResult && breathResult.trim().length > 0 && !breathResult.includes('记忆池现在是空的')) {
-        ombreMemory = `\n\n[你想起的相关记忆]\n${breathResult}\n[记忆结束]`
-        console.log('🧠 检索到记忆:', ombreMemory.substring(0, 200) + '...')
+      if (cleanedMemory && cleanedMemory.length > 0 && !cleanedMemory.includes('记忆池现在是空的')) {
+        ombreMemory = `\n\n[你想起的相关记忆]\n${cleanedMemory}\n[记忆结束]`
+        console.log('🧠 检索到记忆条数:', cleanedMemory.split('\n---\n').length)
       }
     } catch (e) { console.error('记忆检索失败:', e.message) }
     if (ombreMemory) systemPrompt += ombreMemory
@@ -551,13 +582,15 @@ app.post('/api/chat', async (req, res) => {
     }
 
         // 9.5 存储到 Ombre Brain（AI 自主判断）
+    // 注：hold 只传 content，让 Ombre Brain 自己打标+判断相似度合并。
+    // 之前额外传的 tags/importance 不是官方文档里 hold 支持的参数，
+    // 怀疑是它导致相似记忆（如反复问"喜欢吃什么"）没能正确合并、
+    // 存成了一堆几乎重复的独立桶，把 breath 检索名额占满。
     try {
       const worthIt = await shouldRemember(content, replyText);
       if (worthIt) {
         const holdResult = await callOmbreTool('hold', {
-          content: `用户说：${content}\n\n你回复：${replyText}`,
-          tags: `对话,${sessionId}`,
-          importance: 5
+          content: `用户说：${content}\n\n你回复：${replyText}`
         })
         console.log('🧠 记忆已存储:', holdResult)
       } else {
