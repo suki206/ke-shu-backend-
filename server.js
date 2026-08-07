@@ -87,13 +87,22 @@ async function callOmbreTool(toolName, args = {}) {
       })
     });
     const text = await response.text();
-    console.log(`MCP ${toolName} raw:`, text.substring(0, 300));
     const parsed = parseSSEResponse(text);
+    // 调试用：完整打印一次，不截断，用来确认 content/structuredContent 里到底有没有正文
+    console.log(`MCP ${toolName} FULL:`, JSON.stringify(parsed));
+
     if (parsed?.result?.content) {
-      return parsed.result.content
+      const textJoined = parsed.result.content
         .filter(c => c.type === 'text')
         .map(c => c.text)
         .join('\n');
+      // structuredContent 里可能才是完整正文，text 字段有时只是精简摘要
+      if (parsed.result.structuredContent) {
+        return typeof parsed.result.structuredContent === 'string'
+          ? parsed.result.structuredContent
+          : JSON.stringify(parsed.result.structuredContent);
+      }
+      return textJoined;
     }
     return parsed?.result ? parsed.result : null;
   } catch (err) {
