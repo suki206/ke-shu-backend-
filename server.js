@@ -488,18 +488,19 @@ app.post('/api/chat', async (req, res) => {
         }
       }
       
-      // 第2步：用 trace 读取每个 bucket 的实际内容
+      // 第2步：用 source_read 读取每个 bucket 的实际内容
       const contents = []
       for (const bucketId of bucketIds.slice(0, 3)) {
         try {
-          const traceResult = await callOmbreTool('trace', { 
+          const sourceResult = await callOmbreTool('source_read', { 
             bucket_id: bucketId 
           })
-          if (traceResult && traceResult.length > 5) {
-            contents.push(traceResult)
+          console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 100))
+          if (sourceResult && sourceResult.length > 5) {
+            contents.push(sourceResult)
           }
         } catch (e) {
-          console.error(`trace 读取失败 ${bucketId}:`, e.message)
+          console.error(`source_read 读取失败 ${bucketId}:`, e.message)
         }
       }
       
