@@ -471,61 +471,46 @@ app.post('/api/chat', async (req, res) => {
       systemPrompt += `\n【历史记忆】\n${memorySummary}`
     }
 
-               // 5.5 从 Ombre Brain 检索相关记忆
+                      // 5.5 从 Ombre Brain 检索相关记忆（使用 breath-hook HTTP 端点）
     let ombreMemory = ''
     try {
-      // 第1步：breath_search 搜索相关记忆，拿到 bucket_id
-      const searchResult = await callOmbreTool('breath_search', { 
-        query: content, 
-        max_results: 5 
+      // 直接调 breath-hook 端点，它返回格式化的浮现记忆
+      const hookRes = await fetch(`${OMBRE_BRAIN_URL}/breath-hook`, {
+        headers: {
+          'Authorization': `Bearer ${OMBRE_MCP_TOKEN}`
+        }
       })
-      console.log('🧠 breath_search 结果:', searchResult?.substring(0, 300))
-      
-      // 解析 bucket_id
-      const bucketIds = []
-      if (searchResult) {
-        const regex = /bucket_id:([a-f0-9]+)/g
-        let match
-        while ((match = regex.exec(searchResult)) !== null) {
-          if (!bucketIds.includes(match[1])) bucketIds.push(match[1])
-        }
-      }
-      console.log('🧠 找到 bucket_ids:', bucketIds)
-      
-      // 第2步：用 source_read 直接读取每个 bucket 的实际内容
-      const contents = []
-      for (const bucketId of bucketIds.slice(0, 3)) {
-        try {
-          const sourceResult = await callOmbreTool('source_read', { 
-            bucket_id: bucketId
-          })
-          console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 200))
-          if (sourceResult && sourceResult.length > 5 
-              && !sourceResult.includes('Error') 
-              && !sourceResult.includes('Unknown tool')) {
-            contents.push(sourceResult)
+      const hookText = await hookRes.text()
+      console.log('🧠 breath-hook 原始响应:', hookText.substring(0, 500))
+
+      // breath-hook 返回的可能是 SSE 格式或直接文本，尝试解析
+      let memoryText = ''
+      if (hookText.startsWith('data:')) {
+        const lines = hookText.split('\n')
+        for (const line of lines) {
+          if (line.startsWith('data: ') || line.startsWith('data:')) {
+            try {
+              const json = JSON.parse(line.replace(/^data:\s*/, ''))
+              if (json?.memories || json?.content) {
+                memoryText = json.memories || json.content
+              }
+            } catch (e) {}
           }
-        } catch (e) {
-          console.error(`读取失败 ${bucketId}:`, e.message)
         }
-      }
-      
-      // 第3步：如果 source_read 拿到了内容，注入上下文
-      if (contents.length > 0) {
-        ombreMemory = `\n\n[你想起的相关记忆]\n${contents.join('\n---\n')}\n[记忆结束]`
-        console.log('🧠 注入记忆上下文:', ombreMemory.substring(0, 200) + '...')
-      } else {
-        // fallback：用无参数 breath 获取浮现记忆
-        const surfacingResult = await callOmbreTool('breath', {})
-        console.log('🧠 breath fallback:', surfacingResult?.substring(0, 300))
-        if (surfacingResult && surfacingResult.length > 10 
-            && !surfacingResult.includes('Error')
-            && !surfacingResult.includes('Unknown tool')) {
-          ombreMemory = `\n\n[你想起的记忆]\n${surfacingResult}\n[记忆结束]`
+        // 如果 SSE 解析没拿到，尝试把 data: 后面的内容当纯文本
+        if (!memoryText && hookText.length > 10) {
+          memoryText = hookText.replace(/^data:\s*/gm, '').trim()
         }
+      } else if (hookText.length > 10) {
+        memoryText = hookText
       }
-    } catch (e) { 
-      console.error('记忆检索失败:', e.message) 
+
+      if (memoryText && memoryText.length > 10 && !memoryText.includes('Error')) {
+        ombreMemory = `\n\n[你的长期记忆]\n${memoryText}\n[记忆结束]`
+        console.log('🧠 注入记忆:', ombreMemory.substring(0, 200) + '...')
+      }
+    } catch (e) {
+      console.error('breath-hook 失败:', e.message)
     }
     if (ombreMemory) systemPrompt += ombreMemory
 
