@@ -103,6 +103,7 @@ async function callOmbreTool(toolName, args = {}) {
   }
 }
 
+const bucketTitleMap = new Map()
 // ===== 判断对话是否值得记住 =====
 async function shouldRemember(content, replyText) {
   try {
@@ -471,47 +472,49 @@ app.post('/api/chat', async (req, res) => {
       systemPrompt += `\n【历史记忆】\n${memorySummary}`
     }
 
-                      // 5.5 从 Ombre Brain 检索相关记忆（使用 breath-hook HTTP 端点）
+        // 5.5 从 Ombre Brain 检索相关记忆
     let ombreMemory = ''
     try {
-      // 直接调 breath-hook 端点，它返回格式化的浮现记忆
-      const hookRes = await fetch(`${OMBRE_BRAIN_URL}/breath-hook`, {
-        headers: {
-          'Authorization': `Bearer ${OMBRE_MCP_TOKEN}`
+      const breathResult = await callOmbreTool('breath', { query: content, max_results: 8 })
+      console.log('🧠 breath raw:', breathResult?.substring(0, 200))
+      
+      const bucketIds = []
+      if (breathResult) {
+        const regex = /bucket_id:([a-f0-9]+)/g
+        let match
+        while ((match = regex.exec(breathResult)) !== null) {
+          if (!bucketIds.includes(match[1])) bucketIds.push(match[1])
         }
-      })
-      const hookText = await hookRes.text()
-      console.log('🧠 breath-hook 原始响应:', hookText.substring(0, 500))
-
-      // breath-hook 返回的可能是 SSE 格式或直接文本，尝试解析
-      let memoryText = ''
-      if (hookText.startsWith('data:')) {
-        const lines = hookText.split('\n')
-        for (const line of lines) {
-          if (line.startsWith('data: ') || line.startsWith('data:')) {
-            try {
-              const json = JSON.parse(line.replace(/^data:\s*/, ''))
-              if (json?.memories || json?.content) {
-                memoryText = json.memories || json.content
-              }
-            } catch (e) {}
+      }
+      console.log('🧠 解析到 bucket_ids:', bucketIds)
+      
+      const contents = []
+      for (const bucketId of bucketIds.slice(0, 3)) {
+        try {
+          const title = bucketTitleMap.get(bucketId)
+          if (!title) {
+            console.log(`⚠️ 缓存无标题 ${bucketId}，跳过`)
+            continue
           }
+          
+          const sourceResult = await callOmbreTool('source_read', { 
+            bucket_id: bucketId,
+            expected_title: title
+          })
+          console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 200))
+          if (sourceResult && sourceResult.length > 5 && !sourceResult.includes('Error')) {
+            contents.push(sourceResult)
+          }
+        } catch (e) {
+          console.error(`source_read 失败 ${bucketId}:`, e.message)
         }
-        // 如果 SSE 解析没拿到，尝试把 data: 后面的内容当纯文本
-        if (!memoryText && hookText.length > 10) {
-          memoryText = hookText.replace(/^data:\s*/gm, '').trim()
-        }
-      } else if (hookText.length > 10) {
-        memoryText = hookText
       }
-
-      if (memoryText && memoryText.length > 10 && !memoryText.includes('Error')) {
-        ombreMemory = `\n\n[你的长期记忆]\n${memoryText}\n[记忆结束]`
-        console.log('🧠 注入记忆:', ombreMemory.substring(0, 200) + '...')
+      
+      if (contents.length > 0) {
+        ombreMemory = `\n\n[你想起的相关记忆]\n${contents.join('\n---\n')}\n[记忆结束]`
+        console.log('🧠 检索到记忆:', ombreMemory.substring(0, 200) + '...')
       }
-    } catch (e) {
-      console.error('breath-hook 失败:', e.message)
-    }
+    } catch (e) { console.error('记忆检索失败:', e.message) }
     if (ombreMemory) systemPrompt += ombreMemory
 
     // 6. 读取可见历史消息（用于发送给模型）
@@ -575,7 +578,7 @@ app.post('/api/chat', async (req, res) => {
       return res.status(500).json({ error: 'AI回复保存失败: ' + aiSaveErr.message })
     }
 
-    // 9.5 存储到 Ombre Brain（AI 自主判断）
+        // 9.5 存储到 Ombre Brain（AI 自主判断）
     try {
       const worthIt = await shouldRemember(content, replyText);
       if (worthIt) {
@@ -585,6 +588,17 @@ app.post('/api/chat', async (req, res) => {
           importance: 5
         })
         console.log('🧠 记忆已存储:', holdResult)
+        
+        // 解析 bucket_id 和标题，存入内存缓存
+        if (holdResult) {
+          const match = holdResult.match(/→([a-f0-9]+)\s+(.+)/)
+          if (match) {
+            const bucketId = match[1]
+            const title = match[2].trim()
+            bucketTitleMap.set(bucketId, title)
+            console.log('🧠 标题已缓存:', bucketId, title)
+          }
+        }
       } else {
         console.log('🧠 判断为不重要，跳过存储')
       }
