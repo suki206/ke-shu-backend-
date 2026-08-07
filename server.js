@@ -103,7 +103,6 @@ async function callOmbreTool(toolName, args = {}) {
   }
 }
 
-const bucketTitleMap = new Map()
 // ===== 判断对话是否值得记住 =====
 async function shouldRemember(content, replyText) {
   try {
@@ -473,45 +472,15 @@ app.post('/api/chat', async (req, res) => {
     }
 
         // 5.5 从 Ombre Brain 检索相关记忆
+    // 说明：breath 本身返回的就是记忆正文（官方12个工具里没有 source_read 这个工具，
+    // 之前的二次读取逻辑一直在调一个不存在的工具，导致记忆永远检索不到），直接用即可。
     let ombreMemory = ''
     try {
       const breathResult = await callOmbreTool('breath', { query: content, max_results: 8 })
-      console.log('🧠 breath raw:', breathResult?.substring(0, 200))
-      
-      const bucketIds = []
-      if (breathResult) {
-        const regex = /bucket_id:([a-f0-9]+)/g
-        let match
-        while ((match = regex.exec(breathResult)) !== null) {
-          if (!bucketIds.includes(match[1])) bucketIds.push(match[1])
-        }
-      }
-      console.log('🧠 解析到 bucket_ids:', bucketIds)
-      
-      const contents = []
-      for (const bucketId of bucketIds.slice(0, 3)) {
-        try {
-          const title = bucketTitleMap.get(bucketId)
-          if (!title) {
-            console.log(`⚠️ 缓存无标题 ${bucketId}，跳过`)
-            continue
-          }
-          
-          const sourceResult = await callOmbreTool('source_read', { 
-            bucket_id: bucketId,
-            expected_title: title
-          })
-          console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 200))
-          if (sourceResult && sourceResult.length > 5 && !sourceResult.includes('Error')) {
-            contents.push(sourceResult)
-          }
-        } catch (e) {
-          console.error(`source_read 失败 ${bucketId}:`, e.message)
-        }
-      }
-      
-      if (contents.length > 0) {
-        ombreMemory = `\n\n[你想起的相关记忆]\n${contents.join('\n---\n')}\n[记忆结束]`
+      console.log('🧠 breath raw:', breathResult?.substring(0, 300))
+
+      if (breathResult && breathResult.trim().length > 0 && !breathResult.includes('记忆池现在是空的')) {
+        ombreMemory = `\n\n[你想起的相关记忆]\n${breathResult}\n[记忆结束]`
         console.log('🧠 检索到记忆:', ombreMemory.substring(0, 200) + '...')
       }
     } catch (e) { console.error('记忆检索失败:', e.message) }
@@ -588,17 +557,6 @@ app.post('/api/chat', async (req, res) => {
           importance: 5
         })
         console.log('🧠 记忆已存储:', holdResult)
-        
-        // 解析 bucket_id 和标题，存入内存缓存
-        if (holdResult) {
-          const match = holdResult.match(/→([a-f0-9]+)\s+(.+)/)
-          if (match) {
-            const bucketId = match[1]
-            const title = match[2].trim()
-            bucketTitleMap.set(bucketId, title)
-            console.log('🧠 标题已缓存:', bucketId, title)
-          }
-        }
       } else {
         console.log('🧠 判断为不重要，跳过存储')
       }
