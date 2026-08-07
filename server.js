@@ -488,20 +488,41 @@ app.post('/api/chat', async (req, res) => {
         }
       }
       
-      // 第2步：用 source_read 读取每个 bucket 的实际内容
+      // 第2步：先 bucket_read 获取标题，再 source_read 读取内容
       const contents = []
       for (const bucketId of bucketIds.slice(0, 3)) {
         try {
+          // 先获取桶信息（包含标题）
+          const bucketInfo = await callOmbreTool('bucket_read', { bucket_id: bucketId })
+          console.log(`📖 bucket_read (${bucketId}):`, bucketInfo?.substring(0, 200))
+          
+          // 提取标题
+          let title = ''
+          try {
+            const info = JSON.parse(bucketInfo)
+            title = info.title || info.name || ''
+          } catch {
+            // 如果不是 JSON，尝试从文本中提取
+            const match = bucketInfo?.match(/title["']?\s*[:=]\s*["']?([^"'\n]+)/)
+            if (match) title = match[1].trim()
+          }
+          
+          if (!title) {
+            console.log(`⚠️ 无法获取标题 ${bucketId}，跳过`)
+            continue
+          }
+          
+          // 再用 source_read 读取实际内容
           const sourceResult = await callOmbreTool('source_read', { 
             bucket_id: bucketId,
-            expected_title: ''
+            expected_title: title
           })
-          console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 100))
-          if (sourceResult && sourceResult.length > 5) {
+          console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 200))
+          if (sourceResult && sourceResult.length > 5 && !sourceResult.includes('Error')) {
             contents.push(sourceResult)
           }
         } catch (e) {
-          console.error(`source_read 读取失败 ${bucketId}:`, e.message)
+          console.error(`读取失败 ${bucketId}:`, e.message)
         }
       }
       
