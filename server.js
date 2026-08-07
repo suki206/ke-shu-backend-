@@ -493,7 +493,8 @@ app.post('/api/chat', async (req, res) => {
       for (const bucketId of bucketIds.slice(0, 3)) {
         try {
           const sourceResult = await callOmbreTool('source_read', { 
-            bucket_id: bucketId 
+            bucket_id: bucketId,
+            expected_title: ''
           })
           console.log(`📖 source_read (${bucketId}):`, sourceResult?.substring(0, 100))
           if (sourceResult && sourceResult.length > 5) {
