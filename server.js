@@ -106,12 +106,17 @@ async function callOmbreTool(toolName, args = {}) {
   }
 }
 
-// ===== 判断对话是否值得记住 =====
-async function shouldRemember(content, replyText) {
+// ===== 判断用户这句话是否含有值得记住的事实 =====
+// 注意：只看用户自己说了什么，不看 AI 的回复——AI 的回复可能只是猜测、
+// 反问或情绪化寒暄，把这些当"事实"存进记忆库会污染以后的检索结果。
+async function shouldRemember(content) {
   try {
-    const judgePrompt = `判断以下对话是否包含值得长期记住的信息（如个人喜好、身份、计划、重要事件、情绪状态）。只回复"是"或"否"，不要解释。
-用户：${content}
-AI：${replyText}`;
+    const judgePrompt = `判断以下这句话本身，是否包含用户明确陈述的、值得长期记住的事实（如个人喜好、身份信息、计划安排、重要事件）。
+只看这句话是否是用户自己说出的具体事实，不要管语气或是否礼貌。
+如果只是打招呼、闲聊、提问、或不含具体信息，回答"否"。
+只回复"是"或"否"，不要解释。
+
+用户说：${content}`;
 
     const response = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
@@ -131,7 +136,39 @@ AI：${replyText}`;
     return answer.includes('是');
   } catch (e) {
     console.error('记忆判断失败:', e.message);
-    return true;
+    return false // 判断失败时保守跳过，不乱存
+  }
+}
+
+// ===== 把用户这句话提炼成一句精简事实，再存进 Ombre Brain =====
+// 只存"用户喜欢西瓜"这种一句话结论，不存整段用户原话+AI回复。
+// 这样存储的记忆本身更短，breath 检索时塞回 system prompt 的 token 也更少。
+async function extractFact(content) {
+  try {
+    const prompt = `把用户这句话里的事实提炼成一句最简短的陈述句（不超过20字），第三人称"用户"开头。
+只输出提炼后的句子，不要解释，不要标点以外的多余内容。
+
+用户说：${content}`;
+
+    const response = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 40,
+        temperature: 0
+      })
+    });
+    const data = await response.json();
+    const fact = data.choices?.[0]?.message?.content?.trim()
+    return fact || `用户说：${content}`
+  } catch (e) {
+    console.error('事实提炼失败:', e.message)
+    return `用户说：${content}` // 提炼失败就退回存原话，不影响功能
   }
 }
 
@@ -475,9 +512,10 @@ app.post('/api/chat', async (req, res) => {
     }
 
 // 清洗 breath 返回的原始文本：去掉 [bucket_id:...] [payload_sha256:...] Footprint:... 等
-// 对模型毫无意义、纯粹浪费 token 的元数据标记，只留下"用户说/你回复"这种真正的正文，
-// 并按正文内容去重（同一件事的多条相似记忆只保留一条，省 token）。
-function cleanBreathMemory(raw) {
+// 对模型毫无意义、纯粹浪费 token 的元数据标记，只留下用户事实本身，
+// 并按内容去重（同一件事的多条相似记忆只保留一条）。
+// maxItems：塞进 system prompt 的记忆条数上限，防止一次检索太多记忆把 token 堆爆。
+function cleanBreathMemory(raw, maxItems = 8) {
   if (!raw) return ''
   // 按 \n---\n 或独立的 [bucket_id:xxx] 行切分出每条记忆
   const chunks = raw.split(/\n?---\n?|\[bucket_id:[a-f0-9]+\]/).map(s => s.trim()).filter(Boolean)
@@ -485,37 +523,45 @@ function cleanBreathMemory(raw) {
   const seen = new Set()
   const cleaned = []
   for (let chunk of chunks) {
-    // 去掉所有中括号元数据标记，如 [content_role:xxx] [instructions:false] [payload_chars:73] 等
-    chunk = chunk.replace(/\[[a-z_]+:[^\]]*\]/gi, '').trim()
+    if (cleaned.length >= maxItems) break // 够数了就不再处理，省token也省计算
+
+    // 去掉所有中括号元数据标记，如 [content_role:xxx] [payload_sha256:...] [boundary_id:...] 等
+    chunk = chunk.replace(/\[[a-z0-9_]+:[^\]]*\]/gi, '').trim()
     // 去掉 Footprint 溯源行（对当前对话没用）
     chunk = chunk.replace(/Footprint[:：][^\n]*/g, '').trim()
-    // 去掉多余空行
+
+    // 旧记忆是"用户说：xxx\n\n你回复：一大段"格式，AI回复对判断事实没用，
+    // 只留用户说的那句话；新存的记忆本身就是一句话事实，这一步对它们不影响
+    // （因为它们不含"用户说："这个前缀，匹配不上，chunk 保持原样）。
+    const userLineMatch = chunk.match(/用户说[：:]\s*([^\n]+)/)
+    if (userLineMatch) {
+      chunk = userLineMatch[1].trim()
+    }
+
     chunk = chunk.replace(/\n{2,}/g, '\n').trim()
     if (!chunk || chunk.length < 4) continue
 
-    // 用"用户说"后面那句话去重（火锅类高度相似的记忆只保留第一条）
-    const dedupeKey = chunk.slice(0, 30)
+    const dedupeKey = chunk.slice(0, 20)
     if (seen.has(dedupeKey)) continue
     seen.add(dedupeKey)
     cleaned.push(chunk)
   }
-  return cleaned.join('\n---\n')
+  return cleaned.join('；')
 }
 
         // 5.5 从 Ombre Brain 检索相关记忆
-    // 说明：breath 本身返回的就是记忆正文（官方12个工具里没有 source_read 这个工具，
-    // 之前的二次读取逻辑一直在调一个不存在的工具，导致记忆永远检索不到），直接用即可。
-    // max_results 调大一些，避免高度相似的记忆（如反复出现的"火锅"）把检索名额占满，
-    // 挤掉真正相关但只出现过一次的记忆（如"西瓜"）。
+    // 说明：breath 本身返回的就是记忆正文，直接用即可。
+    // max_results 调大一些避免高频记忆挤掉低频但相关的记忆，
+    // 但最终只挑前 8 条清洗后的事实塞进 prompt（cleanBreathMemory 的 maxItems），控制 token。
     let ombreMemory = ''
     try {
       const breathResult = await callOmbreTool('breath', { query: content, max_results: 20 })
-      const cleanedMemory = cleanBreathMemory(breathResult)
-      console.log('🧠 breath 清洗后:', cleanedMemory?.substring(0, 500))
+      const cleanedMemory = cleanBreathMemory(breathResult, 8)
+      console.log('🧠 breath 清洗后:', cleanedMemory)
 
       if (cleanedMemory && cleanedMemory.length > 0 && !cleanedMemory.includes('记忆池现在是空的')) {
-        ombreMemory = `\n\n[你想起的相关记忆]\n${cleanedMemory}\n[记忆结束]`
-        console.log('🧠 检索到记忆条数:', cleanedMemory.split('\n---\n').length)
+        ombreMemory = `\n\n[你记得的事]\n${cleanedMemory}`
+        console.log('🧠 检索到记忆条数:', cleanedMemory.split('；').length)
       }
     } catch (e) { console.error('记忆检索失败:', e.message) }
     if (ombreMemory) systemPrompt += ombreMemory
@@ -581,18 +627,15 @@ function cleanBreathMemory(raw) {
       return res.status(500).json({ error: 'AI回复保存失败: ' + aiSaveErr.message })
     }
 
-        // 9.5 存储到 Ombre Brain（AI 自主判断）
-    // 注：hold 只传 content，让 Ombre Brain 自己打标+判断相似度合并。
-    // 之前额外传的 tags/importance 不是官方文档里 hold 支持的参数，
-    // 怀疑是它导致相似记忆（如反复问"喜欢吃什么"）没能正确合并、
-    // 存成了一堆几乎重复的独立桶，把 breath 检索名额占满。
+        // 9.5 存储到 Ombre Brain
+    // 只看用户这句话本身是否含事实（不看AI回复，AI回复可能是猜测），
+    // 值得存的话，先提炼成一句短陈述句再 hold——存储和检索都更省 token。
     try {
-      const worthIt = await shouldRemember(content, replyText);
+      const worthIt = await shouldRemember(content);
       if (worthIt) {
-        const holdResult = await callOmbreTool('hold', {
-          content: `用户说：${content}\n\n你回复：${replyText}`
-        })
-        console.log('🧠 记忆已存储:', holdResult)
+        const fact = await extractFact(content)
+        const holdResult = await callOmbreTool('hold', { content: fact })
+        console.log('🧠 记忆已存储:', fact, '→', holdResult)
       } else {
         console.log('🧠 判断为不重要，跳过存储')
       }
