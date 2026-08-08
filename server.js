@@ -535,12 +535,13 @@ function stripTagsAndFootprint(text) {
     .trim()
 }
 
+app.get('/api/memories/catalog/raw', async (req, res) => {
+  const raw = await callOmbreTool('breath', { catalog: true, max_results: 200 })
+  res.type('text/plain').send(raw || '(empty)')
+})
+
 app.get('/api/memories/catalog', async (req, res) => {
   try {
-    // catalog=true 走目录模式；如果这个参数名跟实际部署的 Ombre Brain
-    // 版本对不上，会自动退化成普通 breath 模式，不会报错，只是拿到的
-    // 是叙事文本而不是逐桶元数据（前端仍可用，只是 fade_level 会走
-    // fallback 坡度而不是真实衰减值）。
     const raw = await callOmbreTool('breath', { catalog: true, max_results: 200 })
     if (!raw) return res.json({ memories: [], total: 0, fieldsDetected: [] })
 
