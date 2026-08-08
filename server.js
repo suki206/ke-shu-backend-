@@ -435,6 +435,174 @@ app.get('/api/memories/list', async (req, res) => {
   }
 })
 
+// ============================================================
+// 星尘 3D 粒子记忆库 · 结构化记忆目录（D级）
+// ------------------------------------------------------------
+// 用 breath 的 catalog=true 目录模式一次性拿全量记忆桶的元数据行
+// （0 LLM 调用，最省 token），解析出 valence/arousal 等情感坐标和
+// 衰减相关字段，前端 Three.js 粒子系统据此渲染明暗/位置/颜色。
+//
+// ⚠️ 注意：Ombre Brain 的 catalog 输出目前是纯文本（[key:value] 括号
+// 标签风格，跟 breath 普通模式一致），不是结构化 JSON。下面用通用正
+// 则把每个桶里出现的所有 [key:value] 标签都提取出来，不假设固定字
+// 段名——真实字段名以你部署后实际看到的 raw/fieldsDetected 为准，
+// 如果和下面 CANDIDATE_KEYS 猜的不一致，改一行映射表就行，不用动别
+// 的逻辑。
+// ============================================================
+
+// 每个"逻辑字段"允许匹配的候选 key 名（大小写不敏感），命中第一个就用
+const CANDIDATE_KEYS = {
+  valence:          ['valence', 'emotional_valence', 'v'],
+  arousal:          ['arousal', 'emotional_arousal', 'a'],
+  importance:       ['importance', 'weight'],
+  activationCount:  ['activation_count', 'access_count', 'recall_count'],
+  daysSinceActive:  ['days_since_active', 'days', 'age_days'],
+  domain:           ['domain', 'category'],
+  resolved:         ['resolved', 'is_resolved'],
+  pinned:           ['pinned', 'is_pinned'],
+  timestamp:        ['timestamp', 'created_at', 'last_active', 'updated_at'],
+  bucketId:         ['bucket_id', 'id'],
+}
+
+function pickField(tags, logicalName) {
+  const candidates = CANDIDATE_KEYS[logicalName] || []
+  for (const key of candidates) {
+    const hit = Object.keys(tags).find(k => k.toLowerCase() === key)
+    if (hit !== undefined && tags[hit] !== '') return tags[hit]
+  }
+  return undefined
+}
+
+function toNum(v) {
+  if (v === undefined || v === null) return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+// 衰减公式取自 Ombre Brain README（decay.lambda 默认 0.05，
+// emotion_weights.base=1.0，arousal_boost=0.8）。因为 importance ×
+// activation_count 的乘积没有一个天然上限，这里用 score/(score+k) 做
+// 饱和归一化压到 (0,1)，而不是硬编码一个"最大值"——k 越大，需要越
+// "重"的记忆才会显得鲜明，部署后如果发现粒子普遍偏暗/偏亮，调整这
+// 里的 K 就行。
+const DECAY_LAMBDA = 0.05
+const AROUSAL_BASE = 1.0
+const AROUSAL_BOOST = 0.8
+const SATURATION_K = 4
+
+function timeWeight(days) {
+  if (days === null) return 0.6 // 未知时给个中间值，不特殊突出也不特殊淡化
+  if (days <= 1) return 1.0
+  if (days === 2) return 0.9
+  return Math.max(0.3, 0.9 * Math.exp(-0.2197 * (days - 2)))
+}
+
+function computeFadeLevel({ importance, activationCount, daysSinceActive, arousal }, fallbackRank, fallbackTotal) {
+  // 三个核心输入里一个都没解析到 —— 说明 catalog 输出的字段名跟猜测的
+  // 不一样，退化成"按返回顺序做一个粗略的淡出坡度"，保证界面不是一
+  // 片死板的同一种亮度，同时不会假装这是真实数据。
+  if (importance === null && activationCount === null && daysSinceActive === null) {
+    const t = fallbackTotal > 1 ? fallbackRank / (fallbackTotal - 1) : 0
+    return Math.min(0.85, t * 0.8)
+  }
+  const imp   = importance ?? 5
+  const cnt   = Math.max(1, activationCount ?? 1)
+  const days  = daysSinceActive ?? 3
+  const arsl  = arousal ?? 0 // 未知唤醒度按中性处理，不额外加成也不额外惩罚
+
+  const baseScore  = imp * Math.pow(cnt, 0.3) * Math.exp(-DECAY_LAMBDA * days) * (AROUSAL_BASE + Math.abs(arsl) * AROUSAL_BOOST)
+  const finalScore = timeWeight(days) * baseScore
+  const saturated  = finalScore / (finalScore + SATURATION_K) // 0..1，越大越"鲜明"
+  return Math.max(0, Math.min(1, 1 - saturated))
+}
+
+// 通用 [key:value] 标签提取，大小写不敏感，value 允许为空
+function extractTags(text) {
+  const tags = {}
+  const re = /\[([a-z0-9_]+)\s*:\s*([^\]]*)\]/gi
+  let m
+  while ((m = re.exec(text)) !== null) {
+    tags[m[1].toLowerCase()] = m[2].trim()
+  }
+  return tags
+}
+
+function stripTagsAndFootprint(text) {
+  return text
+    .replace(/\[[a-z0-9_]+\s*:[^\]]*\]/gi, '')
+    .replace(/Footprint[:：][^\n]*/g, '')
+    .replace(/\n{2,}/g, '\n')
+    .trim()
+}
+
+app.get('/api/memories/catalog', async (req, res) => {
+  try {
+    // catalog=true 走目录模式；如果这个参数名跟实际部署的 Ombre Brain
+    // 版本对不上，会自动退化成普通 breath 模式，不会报错，只是拿到的
+    // 是叙事文本而不是逐桶元数据（前端仍可用，只是 fade_level 会走
+    // fallback 坡度而不是真实衰减值）。
+    const raw = await callOmbreTool('breath', { catalog: true, max_results: 200 })
+    if (!raw) return res.json({ memories: [], total: 0, fieldsDetected: [] })
+
+    const chunks = raw
+      .split(/\n?---\n?/)
+      .map(s => s.trim())
+      .filter(s => s && s.length > 2)
+
+    const fieldsSeenAcrossAll = new Set()
+    const seenSummary = new Set()
+
+    const memories = chunks.map((chunk, i) => {
+      const tags = extractTags(chunk)
+
+      const bucketId         = pickField(tags, 'bucketId') || `chunk-${i}`
+      const domain            = pickField(tags, 'domain') || null
+      const valence            = toNum(pickField(tags, 'valence'))
+      const arousal            = toNum(pickField(tags, 'arousal'))
+      const importance         = toNum(pickField(tags, 'importance'))
+      const activationCount    = toNum(pickField(tags, 'activationCount'))
+      const daysSinceActive    = toNum(pickField(tags, 'daysSinceActive'))
+      const resolvedRaw        = pickField(tags, 'resolved')
+      const pinnedRaw          = pickField(tags, 'pinned')
+      const timestamp           = pickField(tags, 'timestamp') || null
+
+      ;['valence','arousal','importance','activationCount','daysSinceActive','domain','resolved','pinned','timestamp','bucketId']
+        .forEach(k => { if (pickField(tags, k) !== undefined) fieldsSeenAcrossAll.add(k) })
+
+      let summary = stripTagsAndFootprint(chunk)
+      const m = summary.match(/用户说[：:]\s*([^\n]+)/)
+      if (m) summary = m[1].trim()
+      summary = summary.slice(0, 160)
+
+      return {
+        bucketId, domain, valence, arousal, importance, activationCount, daysSinceActive,
+        resolved: resolvedRaw === undefined ? null : /^(true|1|是)$/i.test(resolvedRaw),
+        pinned:   pinnedRaw   === undefined ? null : /^(true|1|是)$/i.test(pinnedRaw),
+        timestamp, summary,
+        raw: tags,
+      }
+    }).filter(m => {
+      if (!m.summary || m.summary.length < 3) return false
+      const key = m.summary.slice(0, 24)
+      if (seenSummary.has(key)) return false
+      seenSummary.add(key); return true
+    })
+
+    const total = memories.length
+    memories.forEach((m, i) => {
+      m.fadeLevel = computeFadeLevel(
+        { importance: m.importance, activationCount: m.activationCount, daysSinceActive: m.daysSinceActive, arousal: m.arousal },
+        i, total
+      )
+    })
+
+    res.json({ memories, total, fieldsDetected: [...fieldsSeenAcrossAll] })
+  } catch (err) {
+    console.error('记忆目录获取失败:', err.message)
+    res.status(500).json({ error: err.message, memories: [], total: 0, fieldsDetected: [] })
+  }
+})
+
 // 触发 dream（自省消化）
 app.post('/api/memories/dream', async (req, res) => {
   try {
