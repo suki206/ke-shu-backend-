@@ -121,14 +121,27 @@ function cleanBreathMemory(raw, maxItems = 8) {
 }
 
 // ── 判断用户这句话是否值得记住 ────────────────────────────────
-async function shouldRemember(content) {
+// sensitivity 对应常数页"记忆敏感度"三档：
+//   high（高）：与原逻辑一致，只要是用户明确陈述的具体事实就记
+//   medium（中，默认）：同上，保持原有行为不变
+//   low（低）：额外要求情绪波动强烈，平淡陈述即使是事实也不自动存
+// 判断逻辑仍然只用一次 AI 调用完成（低敏感度时换一版更严格的 prompt），
+// 没有引入单独的情绪打分调用，符合"最低成本部署"的原则。
+const REMEMBER_PROMPTS = {
+  high: (content) => `判断以下这句话本身，是否包含用户明确陈述的、值得长期记住的事实（如个人喜好、身份信息、计划安排、重要事件）。只看这句话是否是用户自己说出的具体事实，不要管语气或是否礼貌。如果只是打招呼、闲聊、提问、或不含具体信息，回答"否"。只回复"是"或"否"，不要解释。\n\n用户说：${content}`,
+  medium: (content) => `判断以下这句话本身，是否包含用户明确陈述的、值得长期记住的事实（如个人喜好、身份信息、计划安排、重要事件）。只看这句话是否是用户自己说出的具体事实，不要管语气或是否礼貌。如果只是打招呼、闲聊、提问、或不含具体信息，回答"否"。只回复"是"或"否"，不要解释。\n\n用户说：${content}`,
+  low: (content) => `判断以下这句话是否同时满足两个条件：①包含用户明确陈述的具体事实；②带有强烈的情绪波动（强烈的喜悦、悲伤、愤怒、恐惧、激动等，而不是平淡陈述）。两个条件必须同时满足才回答"是"，只要有一个不满足就回答"否"。只回复"是"或"否"，不要解释。\n\n用户说：${content}`,
+}
+
+async function shouldRemember(content, sensitivity = 'medium') {
+  const buildPrompt = REMEMBER_PROMPTS[sensitivity] || REMEMBER_PROMPTS.medium
   try {
     const r = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'deepseek-chat',
-        messages: [{ role: 'user', content: `判断以下这句话本身，是否包含用户明确陈述的、值得长期记住的事实（如个人喜好、身份信息、计划安排、重要事件）。只看这句话是否是用户自己说出的具体事实，不要管语气或是否礼貌。如果只是打招呼、闲聊、提问、或不含具体信息，回答"否"。只回复"是"或"否"，不要解释。\n\n用户说：${content}` }],
+        messages: [{ role: 'user', content: buildPrompt(content) }],
         max_tokens: 2, temperature: 0,
       }),
     })
@@ -196,6 +209,48 @@ console.log('========================================')
 
 const supabase   = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY)
 const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
+
+// ============================================================
+// 多模型解析 —— 常数页"模型切换"（C级）
+// cfg.models：设置里存的自定义模型列表（JSON 字符串），每项结构：
+//   { id, label, baseUrl, requestModel, apiKeyEnvVar, apiKey }
+// 内置 DeepSeek 永远可用、不占用户填 key（走 DEEPSEEK_API_KEY 环境变量）；
+// 用户新增的模型如果在设置里直接填了 apiKey 就优先用它，
+// 否则退回 apiKeyEnvVar 指定名字的环境变量。
+// 注意：这里假设所有接入的模型都兼容 OpenAI 风格的
+// /chat/completions 请求体与流式返回格式（DeepSeek、Moonshot、Qwen、
+// GLM 等国内主流模型大多如此）。如果以后要接原生 Claude / Gemini 这类
+// 请求体形状完全不同的接口，需要单独加一层适配，不能直接复用这个函数。
+// ============================================================
+const BUILTIN_MODEL_ID = 'deepseek-chat'
+
+function parseModelList(cfg) {
+  const raw = cfg.models
+  if (Array.isArray(raw)) return raw
+  if (typeof raw === 'string') {
+    try { const list = JSON.parse(raw || '[]'); return Array.isArray(list) ? list : [] } catch { return [] }
+  }
+  return []
+}
+
+function resolveModel(cfg, modelId) {
+  if (!modelId || modelId === BUILTIN_MODEL_ID) {
+    return { id: BUILTIN_MODEL_ID, label: 'DeepSeek', baseUrl: DEEPSEEK_URL, requestModel: 'deepseek-chat', apiKey: process.env.DEEPSEEK_API_KEY }
+  }
+  const found = parseModelList(cfg).find(m => m.id === modelId)
+  if (!found) {
+    // 找不到配置（比如被删掉了）就兜底回 DeepSeek，不让聊天直接失败
+    return { id: BUILTIN_MODEL_ID, label: 'DeepSeek', baseUrl: DEEPSEEK_URL, requestModel: 'deepseek-chat', apiKey: process.env.DEEPSEEK_API_KEY }
+  }
+  const apiKey = found.apiKey || (found.apiKeyEnvVar ? process.env[found.apiKeyEnvVar] : '') || ''
+  return {
+    id: found.id,
+    label: found.label || found.id,
+    baseUrl: found.baseUrl || DEEPSEEK_URL,
+    requestModel: found.requestModel || found.id,
+    apiKey,
+  }
+}
 
 // ── 工具函数 ──────────────────────────────────────────────────
 function estimateToken(text) { return text ? Math.ceil(String(text).length / 4) : 0 }
@@ -443,6 +498,7 @@ app.post('/api/chat', async (req, res) => {
     const { data: sRows } = await supabase.from('settings').select('*')
     const cfg = parseSettings(sRows || [])
     const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7, compress_threshold = 3000, compress_keep_rounds = 4 } = cfg
+    const activeModel = resolveModel(cfg, cfg.model)
 
     // 3. 历史 token 统计
     const { data: allHistory } = await supabase.from('messages').select('id,role,content,created_at,visible').eq('session_id', sessionId).order('created_at', { ascending: true })
@@ -481,28 +537,30 @@ app.post('/api/chat', async (req, res) => {
     const sendMessages = [{ role: 'system', content: systemPrompt }]
     if (visHist?.length) sendMessages.push(...visHist.filter(m => m.content != null).map(m => ({ role: m.role, content: String(m.content) })))
 
-    // 8. 调用主模型
-    const aiRes = await fetch(DEEPSEEK_URL, {
+    // 8. 调用主模型（尊重设置里选的模型，不再写死 deepseek-chat）
+    const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model: 'deepseek-chat', messages: sendMessages, temperature: Number(temperature) }),
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
+      body: JSON.stringify({ model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature) }),
     })
     const aiData = await aiRes.json()
     if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
     const replyText = aiData.choices[0].message.content
 
-    // 9. 保存 AI 回复
+    // 9. 保存 AI 回复（附带这次实际用的模型，供 Token 统计按模型拆分）
     const aiNow = new Date().toISOString()
-    const { data: savedMsg, error: aErr } = await supabase.from('messages').insert([{ session_id: sessionId, role: 'assistant', content: replyText, created_at: aiNow, visible: true }]).select()
+    const { data: savedMsg, error: aErr } = await supabase.from('messages').insert([{ session_id: sessionId, role: 'assistant', content: replyText, created_at: aiNow, visible: true, model: activeModel.id }]).select()
     if (aErr) return res.status(500).json({ error: 'AI回复保存失败: ' + aErr.message })
 
-    // 9.5 Ombre Brain hold（非阻塞）
-    shouldRemember(content).then(worth => {
-      if (!worth) return
-      extractFact(content).then(fact => {
-        callOmbreTool('hold', { content: fact }).then(r => console.log('🧠 hold:', fact, '->', r)).catch(e => console.error('hold失败:', e.message))
-      })
-    }).catch(e => console.error('shouldRemember失败:', e.message))
+    // 9.5 Ombre Brain hold（非阻塞；记忆暂停开启时跳过所有自动 hold）
+    if (!cfg.memory_paused) {
+      shouldRemember(content, cfg.memory_sensitivity).then(worth => {
+        if (!worth) return
+        extractFact(content).then(fact => {
+          callOmbreTool('hold', { content: fact }).then(r => console.log('🧠 hold:', fact, '->', r)).catch(e => console.error('hold失败:', e.message))
+        })
+      }).catch(e => console.error('shouldRemember失败:', e.message))
+    }
 
     // 10. 更新会话时间
     await supabase.from('sessions').update({ updated_at: aiNow }).eq('id', sessionId)
@@ -542,7 +600,8 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   // 1. 设置
   const { data: sRows } = await supabase.from('settings').select('*')
   const cfg = parseSettings(sRows || [])
-  const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7, compress_threshold = 3000, compress_keep_rounds = 4, model = 'deepseek-chat' } = cfg
+  const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7, compress_threshold = 3000, compress_keep_rounds = 4 } = cfg
+  const activeModel = resolveModel(cfg, cfg.model)
 
   // 2. 历史
   const { data: allHistory } = await supabase.from('messages').select('id,role,content,created_at,visible').eq('session_id', sessionId).order('created_at', { ascending: true })
@@ -602,12 +661,12 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   let usage      = null
 
   try {
-    // 8. 调用 DeepSeek（stream: true，附带 usage 统计）
-    const aiRes = await fetch(DEEPSEEK_URL, {
+    // 8. 调用选中的模型（尊重常数页"模型切换"，stream: true，附带 usage 统计）
+    const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
       body: JSON.stringify({
-        model, messages: sendMessages, temperature: Number(temperature),
+        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
         stream: true, stream_options: { include_usage: true },
       }),
       signal: upstreamController.signal,
@@ -615,7 +674,7 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
 
     if (!aiRes.ok) {
       const errText = await aiRes.text()
-      send({ error: `DeepSeek 错误: ${errText.slice(0, 300)}` })
+      send({ error: `${activeModel.label} 错误: ${errText.slice(0, 300)}` })
       req.off('close', onClose)
       return res.end()
     }
@@ -661,18 +720,21 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
     truncated: clientAborted || null,
     tokens_input: usage ? usage.prompt_tokens : null,
     tokens_output: usage ? usage.completion_tokens : null,
+    model: activeModel.id,
   }]).select()
 
   // 若客户端已断线，后面无法再 send()，直接返回
   if (clientAborted || res.writableEnded) return
 
-  // 11. Ombre Brain hold（非阻塞，判断是否值得记住这次触发内容）
-  shouldRemember(triggerContent).then(worth => {
-    if (!worth) return
-    extractFact(triggerContent).then(fact => {
-      callOmbreTool('hold', { content: fact }).then(() => console.log('🧠 hold:', fact)).catch(e => console.error('hold失败:', e.message))
-    })
-  }).catch(e => console.error('shouldRemember失败:', e.message))
+  // 11. Ombre Brain hold（非阻塞，判断是否值得记住这次触发内容；记忆暂停开启时跳过）
+  if (!cfg.memory_paused) {
+    shouldRemember(triggerContent, cfg.memory_sensitivity).then(worth => {
+      if (!worth) return
+      extractFact(triggerContent).then(fact => {
+        callOmbreTool('hold', { content: fact }).then(() => console.log('🧠 hold:', fact)).catch(e => console.error('hold失败:', e.message))
+      })
+    }).catch(e => console.error('shouldRemember失败:', e.message))
+  }
 
   // 12. 更新会话时间
   await supabase.from('sessions').update({ updated_at: aiNow }).eq('id', sessionId)
@@ -797,6 +859,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const { data: sRows } = await supabase.from('settings').select('*')
     const cfg = parseSettings(sRows || [])
     const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7 } = cfg
+    const activeModel = resolveModel(cfg, cfg.model)
 
     const { data: allMessages } = await supabase.from('messages').select('id,role,content,created_at').eq('session_id', sessionId).eq('visible', true).order('created_at', { ascending: true })
     if (!allMessages?.length) return res.status(400).json({ error: '没有可重新生成的消息' })
@@ -806,17 +869,17 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
     const sendMessages = [{ role: 'system', content: withTimeAwareness(system_prompt) }, ...allMessages.slice(0, -1).filter(m => m.content != null).map(m => ({ role: m.role, content: String(m.content) }))]
 
-    const aiRes = await fetch(DEEPSEEK_URL, {
+    const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model: 'deepseek-chat', messages: sendMessages, temperature: Number(temperature) }),
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
+      body: JSON.stringify({ model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature) }),
     })
     const aiData = await aiRes.json()
     if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
     const replyText = aiData.choices[0].message.content
 
     const now = new Date().toISOString()
-    await supabase.from('messages').update({ content: replyText, created_at: now }).eq('id', lastMsg.id)
+    await supabase.from('messages').update({ content: replyText, created_at: now, model: activeModel.id }).eq('id', lastMsg.id)
     await supabase.from('sessions').update({ updated_at: now }).eq('id', sessionId)
 
     res.json({ reply: replyText })
@@ -916,17 +979,14 @@ setInterval(() => {
 
 // ============================================================
 // Token 统计接口
-// 说明：messages 表目前没有记录"这条回复用的是哪个模型"，
-// 所以 byModel 暂时只能把全部统计归到当前设置里配置的模型名下；
-// 如果之后要做真正的按模型拆分，需要在 messages 表加一个 model 文本列，
-// 生成回复时把当次用的模型名一起存进去。
+// messages 表需要有 model 文本列（迁移前的老记录 model 为空，
+// 一律按 'deepseek-chat' 归档 —— 因为迁移前整个应用本来就只接了
+// DeepSeek 这一个模型，这样算是符合实际情况的兜底，不是瞎猜）。
+// 建表 SQL：alter table messages add column if not exists model text;
 // ============================================================
 app.get('/api/stats/tokens', async (req, res) => {
   try {
     const { sessionId } = req.query
-    const { data: sRows } = await supabase.from('settings').select('*')
-    const cfg = parseSettings(sRows || [])
-    const currentModel = cfg.model || 'deepseek-chat'
 
     const todayStr = beijingDateStr()
     const { start: todayStart } = beijingDayRange(todayStr)
@@ -940,7 +1000,7 @@ app.get('/api/stats/tokens', async (req, res) => {
     const { start: sevenAgoStart } = beijingDayRange(sevenAgoStr)
 
     const { data: rows, error } = await supabase.from('messages')
-      .select('created_at,tokens_input,tokens_output,session_id')
+      .select('created_at,tokens_input,tokens_output,session_id,model')
       .eq('role', 'assistant')
       .not('tokens_input', 'is', null)
     if (error) return res.status(500).json({ error: error.message })
@@ -951,6 +1011,15 @@ app.get('/api/stats/tokens', async (req, res) => {
     const today   = sum(rows.filter(r => r.created_at >= todayStart))
     const week    = sum(rows.filter(r => r.created_at >= weekStart))
     const session = sessionId ? sum(rows.filter(r => r.session_id === sessionId)) : null
+
+    // 按模型拆分（迁移前的老记录没有 model 列，归到 deepseek-chat 名下）
+    const byModel = {}
+    rows.forEach(r => {
+      const m = r.model || 'deepseek-chat'
+      if (!byModel[m]) byModel[m] = { input: 0, output: 0 }
+      byModel[m].input  += r.tokens_input  || 0
+      byModel[m].output += r.tokens_output || 0
+    })
 
     const trendMap = {}
     for (let i = 6; i >= 0; i--) {
@@ -964,7 +1033,7 @@ app.get('/api/stats/tokens', async (req, res) => {
 
     res.json({
       session, today, week, all,
-      byModel: { [currentModel]: all },
+      byModel,
       trend7d: Object.values(trendMap),
     })
   } catch (err) { res.status(500).json({ error: err.message }) }
