@@ -439,39 +439,40 @@ app.get('/api/memories/list', async (req, res) => {
 // 星尘 3D 粒子记忆库 · 结构化记忆目录（D级）
 // ------------------------------------------------------------
 // 用 breath 的 catalog=true 目录模式一次性拿全量记忆桶的元数据行
-// （0 LLM 调用，最省 token），解析出 valence/arousal 等情感坐标和
-// 衰减相关字段，前端 Three.js 粒子系统据此渲染明暗/位置/颜色。
+// （0 LLM 调用，最省 token），解析出衰减相关字段，前端 Three.js
+// 粒子系统据此渲染明暗/位置/颜色。
 //
-// ⚠️ 注意：Ombre Brain 的 catalog 输出目前是纯文本（[key:value] 括号
-// 标签风格，跟 breath 普通模式一致），不是结构化 JSON。下面用通用正
-// 则把每个桶里出现的所有 [key:value] 标签都提取出来，不假设固定字
-// 段名——真实字段名以你部署后实际看到的 raw/fieldsDetected 为准，
-// 如果和下面 CANDIDATE_KEYS 猜的不一致，改一行映射表就行，不用动别
-// 的逻辑。
+// 真实格式（2026-08-08 用 /api/memories/catalog/raw 核对过）：
+//   === 记忆目录 (35 桶) ===
+//   先看目录定位，再 breath_search(query=...) 精确拉取正文。
+//   --- 动态（35）---
+//   2026-08-07 12-01-29 出生日期2005年3月4日 | 自省 | 5
+//   2026-08-06 11-11-13 妈妈的红烧肉和学校门口的麻辣烫 | 饮食,回忆 | 5
+//   ...
+// 即"时间戳 摘要 | 域(可逗号分隔) | 数字"逐行文本，不是 [key:value]
+// 括号标签，也不是每条记忆一个 --- 分段——--- 只出现在分类标题行
+// （如"动态""置顶""已解决"），35 条记忆全部挤在标题之后逐行排列。
+// 这批数据里没有 valence/arousal/activationCount，星图和深空视图
+// 会走 ConstellationMap.jsx / MemoryDeepSpace.jsx 里已经写好的"情感
+// 未知"兜底（虚线圈聚在原点、中性色），这是预期状态，不是 bug。
+// 如果 Ombre Brain 以后升级 catalog 输出格式，改下面 LINE_RE 这一
+// 个正则就行，不用动别的逻辑。
 // ============================================================
 
-// 每个"逻辑字段"允许匹配的候选 key 名（大小写不敏感），命中第一个就用
-const CANDIDATE_KEYS = {
-  valence:          ['valence', 'emotional_valence', 'v'],
-  arousal:          ['arousal', 'emotional_arousal', 'a'],
-  importance:       ['importance', 'weight'],
-  activationCount:  ['activation_count', 'access_count', 'recall_count'],
-  daysSinceActive:  ['days_since_active', 'days', 'age_days'],
-  domain:           ['domain', 'category'],
-  resolved:         ['resolved', 'is_resolved'],
-  pinned:           ['pinned', 'is_pinned'],
-  timestamp:        ['timestamp', 'created_at', 'last_active', 'updated_at'],
-  bucketId:         ['bucket_id', 'id'],
+// 分类标题行，如 "--- 动态（35）---"；用于给同分类下的记忆打
+// pinned/resolved 状态，跟具体字段解析无关，识别不到就都是 null。
+const CATEGORY_RE = /^-{2,}\s*(.+?)\s*-{2,}$/
+function categoryFlags(name) {
+  const n = (name || '').replace(/[（(].*?[）)]/g, '').trim() // 去掉"（35）"这类计数后缀
+  if (!n) return { pinned: null, resolved: null }
+  return {
+    pinned:   /置顶|pinned/i.test(n) || null,
+    resolved: /已解决|resolved|归档/i.test(n) || null,
+  }
 }
 
-function pickField(tags, logicalName) {
-  const candidates = CANDIDATE_KEYS[logicalName] || []
-  for (const key of candidates) {
-    const hit = Object.keys(tags).find(k => k.toLowerCase() === key)
-    if (hit !== undefined && tags[hit] !== '') return tags[hit]
-  }
-  return undefined
-}
+// 单条记忆行："YYYY-MM-DD HH-MM-SS 摘要 | 域 | 数字"
+const LINE_RE = /^(\d{4}-\d{2}-\d{2})\s+(\d{2})-(\d{2})-(\d{2})\s+(.+?)\s*\|\s*(.+?)\s*\|\s*(-?\d+(?:\.\d+)?)\s*$/
 
 function toNum(v) {
   if (v === undefined || v === null) return null
@@ -516,25 +517,6 @@ function computeFadeLevel({ importance, activationCount, daysSinceActive, arousa
   return Math.max(0, Math.min(1, 1 - saturated))
 }
 
-// 通用 [key:value] 标签提取，大小写不敏感，value 允许为空
-function extractTags(text) {
-  const tags = {}
-  const re = /\[([a-z0-9_]+)\s*:\s*([^\]]*)\]/gi
-  let m
-  while ((m = re.exec(text)) !== null) {
-    tags[m[1].toLowerCase()] = m[2].trim()
-  }
-  return tags
-}
-
-function stripTagsAndFootprint(text) {
-  return text
-    .replace(/\[[a-z0-9_]+\s*:[^\]]*\]/gi, '')
-    .replace(/Footprint[:：][^\n]*/g, '')
-    .replace(/\n{2,}/g, '\n')
-    .trim()
-}
-
 app.get('/api/memories/catalog/raw', async (req, res) => {
   const raw = await callOmbreTool('breath', { catalog: true, max_results: 200 })
   res.type('text/plain').send(raw || '(empty)')
@@ -545,49 +527,52 @@ app.get('/api/memories/catalog', async (req, res) => {
     const raw = await callOmbreTool('breath', { catalog: true, max_results: 200 })
     if (!raw) return res.json({ memories: [], total: 0, fieldsDetected: [] })
 
-    const chunks = raw
-      .split(/\n?---\n?/)
-      .map(s => s.trim())
-      .filter(s => s && s.length > 2)
-
+    const now = Date.now()
     const fieldsSeenAcrossAll = new Set()
     const seenSummary = new Set()
+    const memories = []
+    let currentCategory = null
 
-    const memories = chunks.map((chunk, i) => {
-      const tags = extractTags(chunk)
+    for (const lineRaw of raw.split('\n')) {
+      const line = lineRaw.trim()
+      if (!line) continue
 
-      const bucketId         = pickField(tags, 'bucketId') || `chunk-${i}`
-      const domain            = pickField(tags, 'domain') || null
-      const valence            = toNum(pickField(tags, 'valence'))
-      const arousal            = toNum(pickField(tags, 'arousal'))
-      const importance         = toNum(pickField(tags, 'importance'))
-      const activationCount    = toNum(pickField(tags, 'activationCount'))
-      const daysSinceActive    = toNum(pickField(tags, 'daysSinceActive'))
-      const resolvedRaw        = pickField(tags, 'resolved')
-      const pinnedRaw          = pickField(tags, 'pinned')
-      const timestamp           = pickField(tags, 'timestamp') || null
+      const catMatch = line.match(CATEGORY_RE)
+      if (catMatch) { currentCategory = catMatch[1]; continue } // 分类标题行，不是记忆，跳过
 
-      ;['valence','arousal','importance','activationCount','daysSinceActive','domain','resolved','pinned','timestamp','bucketId']
-        .forEach(k => { if (pickField(tags, k) !== undefined) fieldsSeenAcrossAll.add(k) })
+      const m = line.match(LINE_RE)
+      if (!m) continue // 目录说明行等非记忆内容，跳过
 
-      let summary = stripTagsAndFootprint(chunk)
-      const m = summary.match(/用户说[：:]\s*([^\n]+)/)
-      if (m) summary = m[1].trim()
-      summary = summary.slice(0, 160)
+      const [, ymd, hh, mm, ss, summaryRaw, domainRaw, numRaw] = m
+      const isoTs = `${ymd}T${hh}:${mm}:${ss}`
+      const parsedDate = new Date(isoTs)
+      const daysSinceActive = Number.isNaN(parsedDate.getTime())
+        ? null
+        : Math.max(0, (now - parsedDate.getTime()) / 86400000)
+      const importance = toNum(numRaw)
+      const { pinned, resolved } = categoryFlags(currentCategory)
 
-      return {
-        bucketId, domain, valence, arousal, importance, activationCount, daysSinceActive,
-        resolved: resolvedRaw === undefined ? null : /^(true|1|是)$/i.test(resolvedRaw),
-        pinned:   pinnedRaw   === undefined ? null : /^(true|1|是)$/i.test(pinnedRaw),
-        timestamp, summary,
-        raw: tags,
-      }
-    }).filter(m => {
-      if (!m.summary || m.summary.length < 3) return false
-      const key = m.summary.slice(0, 24)
-      if (seenSummary.has(key)) return false
-      seenSummary.add(key); return true
-    })
+      const summary = summaryRaw.slice(0, 160)
+      const key = summary.slice(0, 24)
+      if (seenSummary.has(key)) continue
+      seenSummary.add(key)
+
+      ;['timestamp', 'domain', 'importance', 'daysSinceActive'].forEach(k => fieldsSeenAcrossAll.add(k))
+
+      memories.push({
+        bucketId: isoTs, // 时间戳本身天然唯一，比 chunk-i 更有意义
+        domain: domainRaw || null,
+        valence: null,       // 这批目录数据没有情感坐标，前端已有"未知"兜底
+        arousal: null,
+        importance,
+        activationCount: null,
+        daysSinceActive,
+        resolved, pinned,
+        timestamp: isoTs,
+        summary,
+        raw: { category: currentCategory, importance: numRaw },
+      })
+    }
 
     const total = memories.length
     memories.forEach((m, i) => {
