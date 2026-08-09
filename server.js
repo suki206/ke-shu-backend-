@@ -93,6 +93,82 @@ async function callOmbreTool(toolName, args = {}) {
   }
 }
 
+// ── 记忆库的删除能力 ─────────────────────────────────────────
+// 落笔会把内容 grow 进记忆桶；那段被删掉时，记忆桶里的那一份也得跟着
+// 消失，否则枢还会"记得"一段已经不存在的文字。不同版本的 Ombre Brain
+// 删除工具叫法不一样，这里先探测一次工具清单再对号入座。
+let ombreToolCache = null
+async function listOmbreTools() {
+  if (!OMBRE_BRAIN_URL) return []
+  if (ombreToolCache) return ombreToolCache
+  try {
+    if (!ombreSessionId) { const ok = await initOmbreSession(); if (!ok) return [] }
+    const r = await fetch(`${OMBRE_BRAIN_URL}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json,text/event-stream',
+        'Mcp-Session-Id': ombreSessionId,
+        'Authorization': `Bearer ${OMBRE_MCP_TOKEN}`,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', params: {}, id: ++ombreCallId }),
+    })
+    const parsed = parseSSEResponse(await r.text())
+    ombreToolCache = parsed?.result?.tools || []
+    console.log('🧠 Ombre 工具清单:', ombreToolCache.map(t => t.name).join(', '))
+    return ombreToolCache
+  } catch (err) {
+    console.error('tools/list 失败:', err.message)
+    return []
+  }
+}
+
+let ombreForgetTool
+async function resolveForgetTool() {
+  if (ombreForgetTool !== undefined) return ombreForgetTool
+  const names = (await listOmbreTools()).map(t => t.name)
+  ombreForgetTool = names.find(n => /forget|delete|remove|prune|erase|drop|release/i.test(n)) || null
+  console.log('🧠 记忆删除工具解析为:', ombreForgetTool || '（这台没有暴露，跳过）')
+  return ombreForgetTool
+}
+
+// grow 的回执里一般带着 bucket_id / id，抓出来存进 entries.memory_ref，
+// 以后删段落时凭它找到对应的记忆
+function extractMemoryRef(growResult) {
+  if (!growResult) return null
+  const s = typeof growResult === 'string' ? growResult : JSON.stringify(growResult)
+  const m = s.match(/bucket_id["':\s]*([A-Za-z0-9_-]{6,})/i)
+        || s.match(/\b(mem_[A-Za-z0-9_-]+)\b/i)
+        || s.match(/"id"\s*:\s*"([A-Za-z0-9_-]{6,})"/i)
+  return m ? m[1] : null
+}
+
+async function growAndRemember(entryId, content, tags = []) {
+  try {
+    const r = await callOmbreTool('grow', { content, tags })
+    console.log('🧠 合墨 grow 归档完成:', r)
+    const ref = extractMemoryRef(r)
+    if (ref && entryId) await supabase.from('entries').update({ memory_ref: ref }).eq('id', entryId)
+  } catch (e) { console.error('合墨 grow 失败:', e.message) }
+}
+
+// 参数名各家不同，挨个试一遍，能删掉就算
+async function forgetOmbreMemory(ref) {
+  if (!OMBRE_BRAIN_URL || !ref) return false
+  const tool = await resolveForgetTool()
+  if (!tool) return false
+  for (const key of ['bucket_id', 'id', 'memory_id', 'target', 'query']) {
+    const r = await callOmbreTool(tool, { [key]: ref })
+    const s = String(r ?? '')
+    if (r && !/error|unknown|invalid|missing|required/i.test(s)) {
+      console.log(`🧠 记忆已删除（${tool}.${key}）:`, ref)
+      return true
+    }
+  }
+  console.warn('🧠 记忆删除没成功，引用:', ref)
+  return false
+}
+
 // ── 清洗 breath 返回的原始文本 ────────────────────────────────
 // 移除 [bucket_id:...] [payload_sha256:...] Footprint:... 等元数据
 // 去重，最多保留 maxItems 条
@@ -1453,6 +1529,10 @@ app.get('/api/stats/tokens', async (req, res) => {
 
 const INK_MODES = ['original', 'continue', 'new']
 
+// 不显式传的话就跟着上游默认值走，有的供应商只给几百 token，
+// 一段还没写完就被切断了——这是"续写只写一句"的次要成因之一
+const INK_MAX_TOKENS = Number(process.env.INK_MAX_TOKENS || 4000)
+
 // 追加正文时统一走这个：不是第一段的话，前面补一个自然的段落换行，
 // 让每一次落笔（不管是柯还是枢）都独立成一段，读起来齐整
 function appendWithBreak(existing, delta) {
@@ -1508,8 +1588,14 @@ app.put('/api/notes/:id', async (req, res) => {
 
 app.delete('/api/notes/:id', async (req, res) => {
   try {
+    const { id } = req.params
+    // 先把这一篇每次落笔留在记忆桶里的那份挨个撤掉，再删笔记本体，
+    // 否则笔记没了、记忆还在，枢会"记得"一段已经不存在的文字
+    const { data: rows } = await supabase.from('entries').select('memory_ref').eq('note_id', id)
+    for (const r of rows || []) { if (r.memory_ref) await forgetOmbreMemory(r.memory_ref) }
+
     // entries 表 note_id 外键建了 on delete cascade，删 notes 会自动带走
-    const { error } = await supabase.from('notes').delete().eq('id', req.params.id)
+    const { error } = await supabase.from('notes').delete().eq('id', id)
     if (error) return res.status(500).json({ error: error.message })
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1568,11 +1654,8 @@ app.post('/api/notes/:id/entries', async (req, res) => {
       draft_content: null, draft_mode: null, draft_updated_at: null, updated_at: now,
     }).eq('id', id)
 
-    if (OMBRE_BRAIN_URL) {
-      callOmbreTool('grow', { content, tags: noteRow.tags || [] })
-        .then(r => console.log('🧠 合墨 grow 归档完成:', r))
-        .catch(e => console.error('合墨 grow 失败:', e.message))
-    }
+    // 归档进记忆桶，并把回执里的引用记在这条 entry 上（将来删这段能一起删）
+    if (OMBRE_BRAIN_URL) growAndRemember(saved[0].id, content, noteRow.tags || [])
 
     res.json(saved[0])
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1585,11 +1668,14 @@ app.delete('/api/notes/:id/last-entry', async (req, res) => {
   try {
     const { id } = req.params
     const { data: last, error: le } = await supabase.from('entries')
-      .select('id,content').eq('note_id', id).order('created_at', { ascending: false }).limit(1).single()
+      .select('id,content,memory_ref').eq('note_id', id).order('created_at', { ascending: false }).limit(1).single()
     if (le || !last) return res.status(404).json({ error: '没有可删除的段落' })
 
     const { data: noteRow, error: ne } = await supabase.from('notes').select('content').eq('id', id).single()
     if (ne || !noteRow) return res.status(404).json({ error: '笔记不存在' })
+
+    // 记忆桶里的那一份跟着一起消失
+    if (last.memory_ref) await forgetOmbreMemory(last.memory_ref)
 
     const { error: de } = await supabase.from('entries').delete().eq('id', last.id)
     if (de) return res.status(500).json({ error: de.message })
@@ -1613,13 +1699,46 @@ function buildInkUserPrompt(mode, note) {
   const title = note.title && note.title !== '未命名手记' ? note.title : '（还没有标题）'
   const doc   = note.content || ''
 
+  // 原来这里写的是"请你写下一段"——要求一段，模型自然就交一段，
+  // 前文说好"说六句话"、真人写了三句，它也只补一句。改成明确要求
+  // 读懂前文定下的结构，把缺口一次性补齐。
+  const finishRule = [
+    '写作要求：',
+    '1. 先读懂前文给这一篇定下的整体结构和篇幅约定。如果前文明确或隐含了数量（要说六句、写三段、五个场景、"第一次/第二次/第三次"这类排序），把还缺的部分一次性全部补齐——缺三句就写三句，不要只写一句就停。',
+    '2. 如果前文没有数量约定，就按它自己的节奏把这一篇写到一个完整的收束，不要停在半路。',
+    '3. 语气、人称、句式长度、断句方式、用不用标点，全部跟前文保持一致，读起来要像同一个人一口气写下来的。',
+    '4. 不要复述或改写前文已有的内容，直接从断掉的地方往下接。',
+    '5. 只输出正文本身：没有开场白、没有解释、没有署名、没有"好的""我来续写"这类话，也不要自己加标题或编号（前文本来就有编号的除外）。',
+  ].join('\n')
+
   if (mode === 'continue') {
-    return `这是你们俩接力在写的一篇文章，标题「${title}」。目前为止的全文：\n\n${doc}\n\n请你写下一段，衔接上一段的语气和节奏接着往下写，就当自己是这篇文章的作者之一。不要加任何多余的开场白、署名或标注，不要重复前文，只输出这一段正文本身。`
+    return `这是你们俩接力在写的同一篇文章，标题「${title}」。
+
+【目前为止的全文】
+${doc}
+
+【你的任务】
+接着最后一个字往下写，把这一篇补完整。
+
+${finishRule}`
   }
   if (mode === 'new') {
-    return `这是你们俩接力在写的一篇文章，标题「${title}」。已经写下的内容：\n\n${doc}\n\n请你基于同样的主题另起一段新的方向或场景——不需要直接承接上一段的具体情节或语气。不要加任何多余的开场白、署名或标注，只输出这一段正文本身。`
+    return `这是你们俩接力在写的同一篇文章，标题「${title}」。
+
+【已经写下的内容】
+${doc}
+
+【你的任务】
+基于同样的主题另起一个新的方向或场景，不必承接上一段的具体情节，但要写成完整的一段内容。
+
+${finishRule}`
   }
-  return `这是一篇新文章的开头，标题「${title}」。请你自由起笔，写下开头这一段。不要加任何多余的开场白、署名或标注，只输出这一段正文本身。`
+  return `这是一篇新文章，标题「${title}」，现在还是白纸一张。
+
+【你的任务】
+由你起笔，写出完整的一篇，不是只写个开头。
+
+${finishRule}`
 }
 
 // ── 枢写一段（SSE 流式，与 /api/chat/stream 同一套读法）────────
@@ -1633,8 +1752,17 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7 } = cfg
   const activeModel = resolveModel(cfg, cfg.model)
 
+  // 这里是"续写只写一句"的主因：合墨复用了聊天的人格设定，而那份
+  // 设定里写着"简短自然回复"。原来这段补充只说了"不要用对话口吻"，
+  // 没把"简短"撤掉，模型当然一句话交差。
   let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
-  systemPrompt += `\n\n[合墨 · 接力写作模式]\n你正在和对方接力写同一篇文章，不是聊天。你写的这部分会被直接拼进正文展示，不会带"枢说"这类前缀，只管把内容写出来，不要用对话口吻回应对方。`
+  systemPrompt += `
+
+[合墨 · 接力写作模式 —— 本段规则优先级高于上面的人格设定]
+你现在不是在聊天，是在和对方接力写同一篇文章。
+· 上面人格设定里关于"简短""简洁""几句话""自然回复"的所有长度要求，在这个模式下一律作废。这里要的是把文章写完整，该多长写多长。
+· 你写的内容会被原样拼进正文，不带"枢说"这类前缀，所以不要用对话口吻、不要回应对方、不要提问。
+· 一次交出完整成品，不要写一半停下来等对方决定。要不要保留、下一步做什么，是对方在界面上点的，你不需要判断，也不要写进正文里。`
 
   // Ombre Brain 召回：标题 + 正文结尾一小段做检索 query
   const tailForQuery = (note.content || '').slice(-200)
@@ -1657,7 +1785,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   const onClose = () => { clientAborted = true; upstreamController.abort(); if (!res.writableEnded) { try { res.destroy() } catch {} } }
   req.on('close', onClose)
 
-  let fullText = '', usage = null
+  let fullText = '', usage = null, finishReason = null
 
   try {
     const aiRes = await fetch(activeModel.baseUrl, {
@@ -1665,6 +1793,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
       body: JSON.stringify({
         model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
+        max_tokens: INK_MAX_TOKENS,
         stream: true, stream_options: { include_usage: true },
       }),
       signal: upstreamController.signal,
@@ -1691,6 +1820,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
             const ev = JSON.parse(t.slice(6))
             const delta = ev.choices?.[0]?.delta
             if (delta?.content) { fullText += delta.content; send({ token: delta.content }) }
+            if (ev.choices?.[0]?.finish_reason) finishReason = ev.choices[0].finish_reason
             if (ev.usage) usage = ev.usage
           } catch {}
         }
@@ -1705,10 +1835,11 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   const cleanText = fullText.trim()
   if (!cleanText) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
 
+  const wasCut = finishReason === 'length'   // 撞到 max_tokens 才算截断
   const now = new Date().toISOString()
   const { data: saved } = await supabase.from('entries').insert([{
     note_id: noteId, author: 'shu', mode, content: cleanText, created_at: now,
-    truncated: clientAborted || null,
+    truncated: clientAborted || wasCut || null,
     tokens_input:  usage ? usage.prompt_tokens     : null,
     tokens_output: usage ? usage.completion_tokens : null,
     model: activeModel.id,
@@ -1718,16 +1849,15 @@ async function runInkStream({ req, res, send, noteId, mode }) {
     content: appendWithBreak(note.content, cleanText), updated_at: now,
   }).eq('id', noteId)
 
-  if (OMBRE_BRAIN_URL) {
-    callOmbreTool('grow', { content: cleanText, tags: note.tags || [] })
-      .then(r => console.log('🧠 合墨 grow 归档完成:', r))
-      .catch(e => console.error('合墨 grow 失败:', e.message))
+  if (OMBRE_BRAIN_URL && saved?.[0]?.id) {
+    growAndRemember(saved[0].id, cleanText, note.tags || [])
   }
 
   if (clientAborted || res.writableEnded) return
   send({
     done: true, content: cleanText,
     entryId: saved?.[0]?.id,
+    truncated: clientAborted || wasCut,
     tokens: usage ? { input: usage.prompt_tokens, output: usage.completion_tokens } : null,
   })
   res.end()
@@ -1750,6 +1880,15 @@ app.post('/api/notes/:id/generate', async (req, res) => {
     send({ error: err.message })
     if (!res.writableEnded) res.end()
   }
+})
+
+// 看一眼这台 Ombre Brain 到底暴露了哪些工具——上面的记忆删除是按
+// 名字匹配（forget/delete/remove…）猜的，对上真名单之后可以写死，
+// 确认完这个接口就能删掉
+app.get('/api/ombre/tools', async (req, res) => {
+  const tools = await listOmbreTools()
+  const forget = await resolveForgetTool()
+  res.json({ forgetTool: forget, tools: tools.map(t => ({ name: t.name, description: t.description })) })
 })
 
 app.listen(PORT, () => { console.log(`🚀 后端服务运行在端口 ${PORT}`) })
