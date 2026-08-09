@@ -1437,15 +1437,21 @@ app.get('/api/stats/tokens', async (req, res) => {
 })
 
 // ============================================================
-// 合墨 · 共笔（引力·右下角天体）
-// notes：一篇手记（标题/标签/草稿/创建更新时间）
-// entries：手记里的一段（作者 ke/shu，模式 original/continue/parallel）
-// 草稿只存在 notes.draft_* 三列上，落笔/让他写 之后才转成 entries
-// 正式行，此时才同步进 Ombre Brain（grow，带 tags，不需要拼进 content）。
+// 合墨 · 接力写作（引力·右下角天体）
+// 一篇 note 只有一个 content（单一正文，接力续写，不是聊天记录式的
+// 一人一段时间流）。entries 只记操作日志——谁在什么时候往正文里
+// 添了哪一段、用了多少 token、枢自己判断的下一步是什么——不作为
+// 展示的数据源，前端靠它做统计和给枢写的片段打徽标。
+// 草稿（draft_*）是"还没落笔的尾巴"：用户正在续写、还没点『落笔』
+// 或『让他写』之前的这一小段，退出笔记会原样保留，重进笔记会把它
+// 接回正文末尾继续写；落笔之后才追加进 content、写进 entries、
+// 同步进 Ombre Brain。
 // ============================================================
 
-// 笔记列表：附带条目数、最新一段预览、是否有未完成草稿——列表页
-// 不需要把所有正文都拉下来，这几个字段够渲染一张卡片
+const INK_MODES = ['original', 'continue', 'new']
+
+// 笔记列表：预览取正文（没正文就退而取草稿），附带段落数、是否有
+// 未完成草稿——列表页不需要拉全文
 app.get('/api/notes', async (req, res) => {
   try {
     const { data: notes, error } = await supabase.from('notes').select('*').order('updated_at', { ascending: false })
@@ -1454,20 +1460,14 @@ app.get('/api/notes', async (req, res) => {
 
     const ids = notes.map(n => n.id)
     const { data: allEntries } = await supabase.from('entries')
-      .select('note_id,content,author,created_at')
-      .in('note_id', ids)
-      .order('created_at', { ascending: false })
-
-    const previewMap = {}, countMap = {}
-    allEntries?.forEach(e => {
-      countMap[e.note_id] = (countMap[e.note_id] || 0) + 1
-      if (!previewMap[e.note_id]) previewMap[e.note_id] = e // 已按时间倒序，第一条命中即最新
-    })
+      .select('note_id').in('note_id', ids)
+    const countMap = {}
+    allEntries?.forEach(e => { countMap[e.note_id] = (countMap[e.note_id] || 0) + 1 })
 
     res.json(notes.map(n => ({
       ...n,
       entryCount: countMap[n.id] || 0,
-      preview: previewMap[n.id] ? previewMap[n.id].content.slice(0, 60) : '',
+      preview: (n.content || n.draft_content || '').slice(0, 60),
       hasDraft: !!(n.draft_content && n.draft_content.trim()),
     })))
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1477,7 +1477,7 @@ app.post('/api/notes/new', async (req, res) => {
   try {
     const now = new Date().toISOString()
     const { data, error } = await supabase.from('notes')
-      .insert([{ title: '未命名手记', tags: [], created_at: now, updated_at: now }]).select()
+      .insert([{ title: '未命名手记', tags: [], content: '', created_at: now, updated_at: now }]).select()
     if (error) return res.status(500).json({ error: error.message })
     res.json(data[0])
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1505,23 +1505,24 @@ app.delete('/api/notes/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// 笔记详情：note 本体（含草稿字段）+ 全部正式段落，按时间正序，
-// 前端就是照这个顺序从上到下渲染成一条连续文稿
+// 笔记详情：note 本体（含 content 全文 + 草稿字段）+ 操作日志
+// entries（按时间正序，前端拿它给 content 里对应的片段打【shu】
+// 徽标，不是拿它拼正文——正文就是 note.content 本身）
 app.get('/api/notes/:id/entries', async (req, res) => {
   try {
     const { id } = req.params
     const { data: note, error: ne } = await supabase.from('notes').select('*').eq('id', id).single()
     if (ne) return res.status(500).json({ error: ne.message })
     const { data: entries, error: ee } = await supabase.from('entries')
-      .select('id,author,mode,content,created_at,model,tokens_input,tokens_output,truncated')
+      .select('id,author,mode,content,decision,created_at,model,tokens_input,tokens_output,truncated')
       .eq('note_id', id).order('created_at', { ascending: true })
     if (ee) return res.status(500).json({ error: ee.message })
     res.json({ note, entries: entries || [] })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// 存草稿：点「待续」时调用，只落在 notes.draft_* 上，不进 entries，
-// 也不算「正式落笔」，所以这里不碰 Ombre Brain
+// 存草稿：点「待续」时调用，只落在 notes.draft_* 上，不碰 content，
+// 不进 entries，也不算「正式落笔」，所以这里不碰 Ombre Brain
 app.post('/api/notes/:id/draft', async (req, res) => {
   try {
     const { content, mode } = req.body || {}
@@ -1533,10 +1534,9 @@ app.post('/api/notes/:id/draft', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-const INK_MODES = ['original', 'continue', 'parallel']
-
-// 用户落笔：无论后续是「落笔」自己存下，还是「让他写」先落自己这段
-// 再触发生成，前端都先走这一个接口，把草稿转成正式段落
+// 用户落笔：把草稿尾巴追加进 note.content，同时写一条 entries 日志
+// （author=ke），清空草稿。无论后续是「落笔」自己存下，还是
+// 「让他写」先落自己这段再触发生成，前端都先走这一个接口。
 app.post('/api/notes/:id/entries', async (req, res) => {
   try {
     const { id } = req.params
@@ -1545,18 +1545,20 @@ app.post('/api/notes/:id/entries', async (req, res) => {
     const useMode = INK_MODES.includes(mode) ? mode : 'original'
     const now = new Date().toISOString()
 
-    const { data: noteRow } = await supabase.from('notes').select('tags').eq('id', id).single()
+    const { data: noteRow, error: fe } = await supabase.from('notes').select('content,tags').eq('id', id).single()
+    if (fe || !noteRow) return res.status(404).json({ error: '笔记不存在' })
 
     const { data: saved, error } = await supabase.from('entries')
       .insert([{ note_id: id, author: 'ke', mode: useMode, content, created_at: now }]).select()
     if (error) return res.status(500).json({ error: error.message })
 
     await supabase.from('notes').update({
+      content: (noteRow.content || '') + content,
       draft_content: null, draft_mode: null, draft_updated_at: null, updated_at: now,
     }).eq('id', id)
 
     if (OMBRE_BRAIN_URL) {
-      callOmbreTool('grow', { content, tags: noteRow?.tags || [] })
+      callOmbreTool('grow', { content, tags: noteRow.tags || [] })
         .then(r => console.log('🧠 合墨 grow 归档完成:', r))
         .catch(e => console.error('合墨 grow 失败:', e.message))
     }
@@ -1566,33 +1568,51 @@ app.post('/api/notes/:id/entries', async (req, res) => {
 })
 
 // ── 生成上下文拼装 ─────────────────────────────────────────────
-// continue：把已有正文整篇喂给模型，要求无缝接续；parallel：只给
-// 标题/标签（外加已有正文供参考、但明确要求另起视角）；original：
-// 笔记还是空的，枢来起笔，只有标题/标签可依据。
-function formatEntriesAsDocument(entries) {
-  return entries.map(e => e.content).join('\n\n')
-}
-function buildInkUserPrompt(mode, note, entries) {
+// continue：把 note.content 整篇喂给模型，要求从结尾原样接上，可以
+// 从半句话接续；new：同样给整篇正文供参考，但明确要求另起一段新
+// 方向，不必衔接上一段；original：正文还是空的，枢来起笔。
+// 三种模式统一要求写完之后另起一行输出 [DECISION: ...] 决策标记，
+// 由枢自己判断这段写完该怎么办，不需要人来点三个按钮确认。
+const DECISION_INSTRUCTION =
+  `\n写完正文后，必须另起一行，输出且仅输出一个决策标记，格式严格是下面三种之一，不要有任何多余文字：\n` +
+  `[DECISION: finalize] —— 你觉得写到这里这篇已经完整了，可以先停在这里\n` +
+  `[DECISION: continue] —— 你想让对方紧接着往下写\n` +
+  `[DECISION: new] —— 你想让对方另起一段新方向，不必直接衔接你刚写的这段`
+
+function buildInkUserPrompt(mode, note) {
   const title = note.title && note.title !== '未命名手记' ? note.title : '（还没有标题）'
   const tags  = (note.tags || []).join('、') || '（还没有标签）'
-  const doc   = formatEntriesAsDocument(entries)
+  const doc   = note.content || ''
 
   if (mode === 'continue') {
-    return `这是你们俩共同在写的一篇手记，标题「${title}」，标签：${tags}。目前为止的正文：\n\n${doc}\n\n请你接着最后一段的语气、节奏和内容往下写，直接衔接，不要重复前文，不要换话题，不要加任何署名或标注，只输出续写的正文本身。`
+    return `这是你们俩接力在写的一篇文章，标题「${title}」，标签：${tags}。目前为止的全文：\n\n${doc}\n\n请你直接从结尾原样接上往下写——如果对方停在半句话中间，你就接着把这句话写完，不要另起段落，不要加任何多余的换行、空格、署名或标注，不要重复前文。${DECISION_INSTRUCTION}`
   }
-  if (mode === 'parallel') {
-    return `这是你们俩共同在写的一篇手记，标题「${title}」，标签：${tags}。已经写下的内容：\n\n${doc}\n\n请你基于同样的主题另起一段独立的表达——不需要延续上面的具体情节或语气，只要还是同一个主题下你自己的角度。不要加任何署名或标注，只输出正文本身。`
+  if (mode === 'new') {
+    return `这是你们俩接力在写的一篇文章，标题「${title}」，标签：${tags}。已经写下的内容：\n\n${doc}\n\n请你基于同样的主题另起一段新的方向或场景——不需要直接承接上一段的具体情节或语气。不要加任何署名或标注。${DECISION_INSTRUCTION}`
   }
-  return `这是一篇新手记的第一段，标题「${title}」，标签：${tags}。请你自由起笔，写下第一段。不要加任何署名或标注，只输出正文本身。`
+  return `这是一篇新文章的开头，标题「${title}」，标签：${tags}。请你自由起笔，写下开头这一段。不要加任何署名或标注。${DECISION_INSTRUCTION}`
 }
 
-// ── 枢写一段（SSE 流式，与 /api/chat/stream 同一套读取方式）────
+// 从模型输出末尾解析并剥离 [DECISION: ...] 标记，返回干净正文 +
+// 决策值；解析不到时兜底 continue（安全默认：交还给用户，不会把
+// 笔记锁死，也不会不清不楚）
+const DECISION_RE = /\[DECISION:\s*(finalize|continue|new)\s*\]\s*$/i
+function stripDecision(raw) {
+  const trimmed = (raw || '').replace(/\s+$/, '')
+  const m = trimmed.match(DECISION_RE)
+  if (!m) return { cleanText: (raw || '').trim(), decision: 'continue' }
+  return { cleanText: trimmed.slice(0, m.index).replace(/\s+$/, ''), decision: m[1].toLowerCase() }
+}
+
+// ── 枢写一段（SSE 流式，与 /api/chat/stream 同一套读法）────────
+// 流式转发时留一小截「安全尾巴」不实时发（HOLD_BACK 字符），等
+// 整段生成完、剥掉 [DECISION: ...] 之后再把剩下的补发出去，这样
+// 决策标记本身永远不会漏进前端展示的正文里。
+const HOLD_BACK = 40
+
 async function runInkStream({ req, res, send, noteId, mode }) {
   const { data: note } = await supabase.from('notes').select('*').eq('id', noteId).single()
   if (!note) { send({ error: '笔记不存在' }); return res.end() }
-
-  const { data: entries } = await supabase.from('entries')
-    .select('author,mode,content,created_at').eq('note_id', noteId).order('created_at', { ascending: true })
 
   const { data: sRows } = await supabase.from('settings').select('*')
   const cfg = parseSettings(sRows || [])
@@ -1600,11 +1620,11 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   const activeModel = resolveModel(cfg, cfg.model)
 
   let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
-  systemPrompt += `\n\n[合墨 · 共笔模式]\n你正在和对方共同写一篇手记，不是聊天。你的这一段会被当成正文直接展示，不会带"枢说"这类前缀，所以不要用对话口吻回应，只管把要写的内容写出来。`
+  systemPrompt += `\n\n[合墨 · 接力写作模式]\n你正在和对方接力写同一篇文章，不是聊天。你写的这部分会被直接拼进正文展示，不会带"枢说"这类前缀，只管把内容写出来，不要用对话口吻回应对方。`
 
-  // Ombre Brain 召回：标题 + 标签 + 最近一段正文做检索 query
-  const lastContent = entries?.length ? entries[entries.length - 1].content : ''
-  const recallQuery = [note.title, (note.tags || []).join(' '), lastContent].filter(Boolean).join(' ').slice(0, 300) || '合墨'
+  // Ombre Brain 召回：标题 + 标签 + 正文结尾一小段做检索 query
+  const tailForQuery = (note.content || '').slice(-200)
+  const recallQuery = [note.title, (note.tags || []).join(' '), tailForQuery].filter(Boolean).join(' ').slice(0, 300) || '合墨'
   let ombreMemory = ''
   try {
     const br = await callOmbreTool('breath', { query: recallQuery, max_results: 20 })
@@ -1615,7 +1635,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
 
   const sendMessages = [
     { role: 'system', content: systemPrompt },
-    { role: 'user',   content: buildInkUserPrompt(mode, note, entries || []) },
+    { role: 'user',   content: buildInkUserPrompt(mode, note) },
   ]
 
   const upstreamController = new AbortController()
@@ -1623,7 +1643,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   const onClose = () => { clientAborted = true; upstreamController.abort(); if (!res.writableEnded) { try { res.destroy() } catch {} } }
   req.on('close', onClose)
 
-  let fullText = '', usage = null
+  let fullText = '', usage = null, sentLen = 0
 
   try {
     const aiRes = await fetch(activeModel.baseUrl, {
@@ -1656,7 +1676,12 @@ async function runInkStream({ req, res, send, noteId, mode }) {
           try {
             const ev = JSON.parse(t.slice(6))
             const delta = ev.choices?.[0]?.delta
-            if (delta?.content) { fullText += delta.content; send({ token: delta.content }) }
+            if (delta?.content) {
+              fullText += delta.content
+              // 留 HOLD_BACK 字符不发，防止 [DECISION: ...] 标记提前流到前端
+              const safeLen = Math.max(0, fullText.length - HOLD_BACK)
+              if (safeLen > sentLen) { send({ token: fullText.slice(sentLen, safeLen) }); sentLen = safeLen }
+            }
             if (ev.usage) usage = ev.usage
           } catch {}
         }
@@ -1670,25 +1695,38 @@ async function runInkStream({ req, res, send, noteId, mode }) {
 
   if (!fullText) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
 
+  const { cleanText, decision } = stripDecision(fullText)
+  // 把还没发出去、且清洗后仍然存在的尾巴补发给前端（正常情况下就是
+  // 剥掉 [DECISION: ...] 之后剩下的最后一小截）
+  if (!clientAborted && !res.writableEnded && cleanText.length > sentLen) {
+    send({ token: cleanText.slice(sentLen) })
+  }
+
   const now = new Date().toISOString()
   const { data: saved } = await supabase.from('entries').insert([{
-    note_id: noteId, author: 'shu', mode, content: fullText, created_at: now,
+    note_id: noteId, author: 'shu', mode, content: cleanText, decision, created_at: now,
     truncated: clientAborted || null,
     tokens_input:  usage ? usage.prompt_tokens     : null,
     tokens_output: usage ? usage.completion_tokens : null,
     model: activeModel.id,
   }]).select()
 
-  await supabase.from('notes').update({ updated_at: now }).eq('id', noteId)
+  await supabase.from('notes').update({
+    content: (note.content || '') + cleanText, updated_at: now,
+  }).eq('id', noteId)
 
   if (OMBRE_BRAIN_URL) {
-    callOmbreTool('grow', { content: fullText, tags: note.tags || [] })
+    callOmbreTool('grow', { content: cleanText, tags: note.tags || [] })
       .then(r => console.log('🧠 合墨 grow 归档完成:', r))
       .catch(e => console.error('合墨 grow 失败:', e.message))
   }
 
   if (clientAborted || res.writableEnded) return
-  send({ done: true, entryId: saved?.[0]?.id, tokens: usage ? { input: usage.prompt_tokens, output: usage.completion_tokens } : null })
+  send({
+    done: true, content: cleanText, decision,
+    entryId: saved?.[0]?.id,
+    tokens: usage ? { input: usage.prompt_tokens, output: usage.completion_tokens } : null,
+  })
   res.end()
 }
 
