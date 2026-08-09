@@ -1388,11 +1388,19 @@ app.get('/api/stats/tokens', async (req, res) => {
     const sevenAgoStr = beijingDateStr(new Date(Date.now() - 6 * 24 * 3600 * 1000))
     const { start: sevenAgoStart } = beijingDayRange(sevenAgoStr)
 
-    const { data: rows, error } = await supabase.from('messages')
+    const { data: msgRows, error } = await supabase.from('messages')
       .select('created_at,tokens_input,tokens_output,session_id,model')
       .eq('role', 'assistant')
       .not('tokens_input', 'is', null)
     if (error) return res.status(500).json({ error: error.message })
+
+    // 合墨（共笔）里枢写的段落也算 token 用量，跟对话消息合并统计，
+    // 只是没有 session_id 概念，用不到 session 维度的筛选
+    const { data: inkRows } = await supabase.from('entries')
+      .select('created_at,tokens_input,tokens_output,model')
+      .eq('author', 'shu')
+      .not('tokens_input', 'is', null)
+    const rows = [...(msgRows || []), ...(inkRows || []).map(r => ({ ...r, session_id: null }))]
 
     const sum = (list) => list.reduce((acc, r) => { acc.input += r.tokens_input || 0; acc.output += r.tokens_output || 0; return acc }, { input: 0, output: 0 })
 
@@ -1426,6 +1434,281 @@ app.get('/api/stats/tokens', async (req, res) => {
       trend7d: Object.values(trendMap),
     })
   } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ============================================================
+// 合墨 · 共笔（引力·右下角天体）
+// notes：一篇手记（标题/标签/草稿/创建更新时间）
+// entries：手记里的一段（作者 ke/shu，模式 original/continue/parallel）
+// 草稿只存在 notes.draft_* 三列上，落笔/让他写 之后才转成 entries
+// 正式行，此时才同步进 Ombre Brain（grow，带 tags，不需要拼进 content）。
+// ============================================================
+
+// 笔记列表：附带条目数、最新一段预览、是否有未完成草稿——列表页
+// 不需要把所有正文都拉下来，这几个字段够渲染一张卡片
+app.get('/api/notes', async (req, res) => {
+  try {
+    const { data: notes, error } = await supabase.from('notes').select('*').order('updated_at', { ascending: false })
+    if (error) return res.status(500).json({ error: error.message })
+    if (!notes?.length) return res.json([])
+
+    const ids = notes.map(n => n.id)
+    const { data: allEntries } = await supabase.from('entries')
+      .select('note_id,content,author,created_at')
+      .in('note_id', ids)
+      .order('created_at', { ascending: false })
+
+    const previewMap = {}, countMap = {}
+    allEntries?.forEach(e => {
+      countMap[e.note_id] = (countMap[e.note_id] || 0) + 1
+      if (!previewMap[e.note_id]) previewMap[e.note_id] = e // 已按时间倒序，第一条命中即最新
+    })
+
+    res.json(notes.map(n => ({
+      ...n,
+      entryCount: countMap[n.id] || 0,
+      preview: previewMap[n.id] ? previewMap[n.id].content.slice(0, 60) : '',
+      hasDraft: !!(n.draft_content && n.draft_content.trim()),
+    })))
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/api/notes/new', async (req, res) => {
+  try {
+    const now = new Date().toISOString()
+    const { data, error } = await supabase.from('notes')
+      .insert([{ title: '未命名手记', tags: [], created_at: now, updated_at: now }]).select()
+    if (error) return res.status(500).json({ error: error.message })
+    res.json(data[0])
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.put('/api/notes/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+    const { title, tags } = req.body
+    const patch = { updated_at: new Date().toISOString() }
+    if (title !== undefined) patch.title = title
+    if (tags !== undefined) patch.tags = tags
+    const { data, error } = await supabase.from('notes').update(patch).eq('id', id).select()
+    if (error) return res.status(500).json({ error: error.message })
+    res.json(data[0])
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.delete('/api/notes/:id', async (req, res) => {
+  try {
+    // entries 表 note_id 外键建了 on delete cascade，删 notes 会自动带走
+    const { error } = await supabase.from('notes').delete().eq('id', req.params.id)
+    if (error) return res.status(500).json({ error: error.message })
+    res.json({ success: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// 笔记详情：note 本体（含草稿字段）+ 全部正式段落，按时间正序，
+// 前端就是照这个顺序从上到下渲染成一条连续文稿
+app.get('/api/notes/:id/entries', async (req, res) => {
+  try {
+    const { id } = req.params
+    const { data: note, error: ne } = await supabase.from('notes').select('*').eq('id', id).single()
+    if (ne) return res.status(500).json({ error: ne.message })
+    const { data: entries, error: ee } = await supabase.from('entries')
+      .select('id,author,mode,content,created_at,model,tokens_input,tokens_output,truncated')
+      .eq('note_id', id).order('created_at', { ascending: true })
+    if (ee) return res.status(500).json({ error: ee.message })
+    res.json({ note, entries: entries || [] })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// 存草稿：点「待续」时调用，只落在 notes.draft_* 上，不进 entries，
+// 也不算「正式落笔」，所以这里不碰 Ombre Brain
+app.post('/api/notes/:id/draft', async (req, res) => {
+  try {
+    const { content, mode } = req.body || {}
+    const { data, error } = await supabase.from('notes')
+      .update({ draft_content: content || null, draft_mode: mode || null, draft_updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).select()
+    if (error) return res.status(500).json({ error: error.message })
+    res.json(data[0])
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+const INK_MODES = ['original', 'continue', 'parallel']
+
+// 用户落笔：无论后续是「落笔」自己存下，还是「让他写」先落自己这段
+// 再触发生成，前端都先走这一个接口，把草稿转成正式段落
+app.post('/api/notes/:id/entries', async (req, res) => {
+  try {
+    const { id } = req.params
+    const { content, mode } = req.body || {}
+    if (!content || !content.trim()) return res.status(400).json({ error: '内容不能为空' })
+    const useMode = INK_MODES.includes(mode) ? mode : 'original'
+    const now = new Date().toISOString()
+
+    const { data: noteRow } = await supabase.from('notes').select('tags').eq('id', id).single()
+
+    const { data: saved, error } = await supabase.from('entries')
+      .insert([{ note_id: id, author: 'ke', mode: useMode, content, created_at: now }]).select()
+    if (error) return res.status(500).json({ error: error.message })
+
+    await supabase.from('notes').update({
+      draft_content: null, draft_mode: null, draft_updated_at: null, updated_at: now,
+    }).eq('id', id)
+
+    if (OMBRE_BRAIN_URL) {
+      callOmbreTool('grow', { content, tags: noteRow?.tags || [] })
+        .then(r => console.log('🧠 合墨 grow 归档完成:', r))
+        .catch(e => console.error('合墨 grow 失败:', e.message))
+    }
+
+    res.json(saved[0])
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ── 生成上下文拼装 ─────────────────────────────────────────────
+// continue：把已有正文整篇喂给模型，要求无缝接续；parallel：只给
+// 标题/标签（外加已有正文供参考、但明确要求另起视角）；original：
+// 笔记还是空的，枢来起笔，只有标题/标签可依据。
+function formatEntriesAsDocument(entries) {
+  return entries.map(e => e.content).join('\n\n')
+}
+function buildInkUserPrompt(mode, note, entries) {
+  const title = note.title && note.title !== '未命名手记' ? note.title : '（还没有标题）'
+  const tags  = (note.tags || []).join('、') || '（还没有标签）'
+  const doc   = formatEntriesAsDocument(entries)
+
+  if (mode === 'continue') {
+    return `这是你们俩共同在写的一篇手记，标题「${title}」，标签：${tags}。目前为止的正文：\n\n${doc}\n\n请你接着最后一段的语气、节奏和内容往下写，直接衔接，不要重复前文，不要换话题，不要加任何署名或标注，只输出续写的正文本身。`
+  }
+  if (mode === 'parallel') {
+    return `这是你们俩共同在写的一篇手记，标题「${title}」，标签：${tags}。已经写下的内容：\n\n${doc}\n\n请你基于同样的主题另起一段独立的表达——不需要延续上面的具体情节或语气，只要还是同一个主题下你自己的角度。不要加任何署名或标注，只输出正文本身。`
+  }
+  return `这是一篇新手记的第一段，标题「${title}」，标签：${tags}。请你自由起笔，写下第一段。不要加任何署名或标注，只输出正文本身。`
+}
+
+// ── 枢写一段（SSE 流式，与 /api/chat/stream 同一套读取方式）────
+async function runInkStream({ req, res, send, noteId, mode }) {
+  const { data: note } = await supabase.from('notes').select('*').eq('id', noteId).single()
+  if (!note) { send({ error: '笔记不存在' }); return res.end() }
+
+  const { data: entries } = await supabase.from('entries')
+    .select('author,mode,content,created_at').eq('note_id', noteId).order('created_at', { ascending: true })
+
+  const { data: sRows } = await supabase.from('settings').select('*')
+  const cfg = parseSettings(sRows || [])
+  const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7 } = cfg
+  const activeModel = resolveModel(cfg, cfg.model)
+
+  let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
+  systemPrompt += `\n\n[合墨 · 共笔模式]\n你正在和对方共同写一篇手记，不是聊天。你的这一段会被当成正文直接展示，不会带"枢说"这类前缀，所以不要用对话口吻回应，只管把要写的内容写出来。`
+
+  // Ombre Brain 召回：标题 + 标签 + 最近一段正文做检索 query
+  const lastContent = entries?.length ? entries[entries.length - 1].content : ''
+  const recallQuery = [note.title, (note.tags || []).join(' '), lastContent].filter(Boolean).join(' ').slice(0, 300) || '合墨'
+  let ombreMemory = ''
+  try {
+    const br = await callOmbreTool('breath', { query: recallQuery, max_results: 20 })
+    const cm = cleanBreathMemory(br, 8)
+    if (cm && !cm.includes('记忆池现在是空的') && cm.length > 0) ombreMemory = `\n\n[你记得的事]\n${cm}`
+  } catch (e) { console.error('合墨记忆检索失败:', e.message) }
+  if (ombreMemory) systemPrompt += ombreMemory
+
+  const sendMessages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user',   content: buildInkUserPrompt(mode, note, entries || []) },
+  ]
+
+  const upstreamController = new AbortController()
+  let clientAborted = false
+  const onClose = () => { clientAborted = true; upstreamController.abort(); if (!res.writableEnded) { try { res.destroy() } catch {} } }
+  req.on('close', onClose)
+
+  let fullText = '', usage = null
+
+  try {
+    const aiRes = await fetch(activeModel.baseUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
+      body: JSON.stringify({
+        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
+        stream: true, stream_options: { include_usage: true },
+      }),
+      signal: upstreamController.signal,
+    })
+
+    if (!aiRes.ok) {
+      const errText = await aiRes.text()
+      send({ error: `${activeModel.label} 错误: ${errText.slice(0, 300)}` })
+      req.off('close', onClose)
+      return res.end()
+    }
+
+    let buf = ''
+    for await (const chunk of aiRes.body) {
+      if (res.writableEnded) break
+      buf += chunk.toString('utf8')
+      const lines = buf.split('\n')
+      buf = lines.pop() || ''
+      for (const line of lines) {
+        const t = line.trim()
+        if (!t || t === 'data: [DONE]') continue
+        if (t.startsWith('data: ')) {
+          try {
+            const ev = JSON.parse(t.slice(6))
+            const delta = ev.choices?.[0]?.delta
+            if (delta?.content) { fullText += delta.content; send({ token: delta.content }) }
+            if (ev.usage) usage = ev.usage
+          } catch {}
+        }
+      }
+    }
+  } catch (err) {
+    if (!(clientAborted || err.name === 'AbortError')) { console.error('合墨生成异常:', err); send({ error: err.message }) }
+  } finally {
+    req.off('close', onClose)
+  }
+
+  if (!fullText) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
+
+  const now = new Date().toISOString()
+  const { data: saved } = await supabase.from('entries').insert([{
+    note_id: noteId, author: 'shu', mode, content: fullText, created_at: now,
+    truncated: clientAborted || null,
+    tokens_input:  usage ? usage.prompt_tokens     : null,
+    tokens_output: usage ? usage.completion_tokens : null,
+    model: activeModel.id,
+  }]).select()
+
+  await supabase.from('notes').update({ updated_at: now }).eq('id', noteId)
+
+  if (OMBRE_BRAIN_URL) {
+    callOmbreTool('grow', { content: fullText, tags: note.tags || [] })
+      .then(r => console.log('🧠 合墨 grow 归档完成:', r))
+      .catch(e => console.error('合墨 grow 失败:', e.message))
+  }
+
+  if (clientAborted || res.writableEnded) return
+  send({ done: true, entryId: saved?.[0]?.id, tokens: usage ? { input: usage.prompt_tokens, output: usage.completion_tokens } : null })
+  res.end()
+}
+
+app.post('/api/notes/:id/generate', async (req, res) => {
+  res.setHeader('Content-Type',      'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control',     'no-cache, no-transform')
+  res.setHeader('Connection',        'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  res.flushHeaders()
+
+  const send = (data) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`) }
+  const useMode = INK_MODES.includes(req.body?.mode) ? req.body.mode : 'original'
+
+  try {
+    await runInkStream({ req, res, send, noteId: req.params.id, mode: useMode })
+  } catch (err) {
+    console.error('合墨生成异常:', err)
+    send({ error: err.message })
+    if (!res.writableEnded) res.end()
+  }
 })
 
 app.listen(PORT, () => { console.log(`🚀 后端服务运行在端口 ${PORT}`) })
