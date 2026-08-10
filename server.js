@@ -1535,21 +1535,34 @@ app.get('/api/notes', async (req, res) => {
     const ids = notes.map(n => n.id)
     const { data: allEntries } = await supabase.from('entries')
       .select('note_id,author').in('note_id', ids).order('created_at', { ascending: true })
-    const countMap = {}, lastAuthorMap = {}
-    // 按创建时间正序遍历，同一个 note_id 后写入的会覆盖前面的，
-    // 遍历完 lastAuthorMap 里存的自然就是每篇笔记最新一条的作者
+    const countMap = {}, lastAuthorMap = {}, firstAuthorMap = {}
+    // 按创建时间正序遍历：同一个 note_id 后写入的会覆盖 lastAuthorMap，
+    // 遍历完存的自然是每篇笔记最新一条的作者；firstAuthorMap 只在
+    // 第一次遇到这个 note_id 时写一次，存的就是第一条（起笔）的作者
     allEntries?.forEach(e => {
       countMap[e.note_id] = (countMap[e.note_id] || 0) + 1
       lastAuthorMap[e.note_id] = e.author
+      if (!(e.note_id in firstAuthorMap)) firstAuthorMap[e.note_id] = e.author
     })
 
-    res.json(notes.map(n => ({
-      ...n,
-      entryCount: countMap[n.id] || 0,
-      lastAuthor: lastAuthorMap[n.id] || null,
-      preview: (n.content || n.draft_content || '').slice(0, 60),
-      hasDraft: !!(n.draft_content && n.draft_content.trim()),
-    })))
+    res.json(notes.map(n => {
+      const hasDraft = !!(n.draft_content && n.draft_content.trim())
+      const entryCount = countMap[n.id] || 0
+      // 起笔人：有 entries 就是第一条的作者；一条 entries 都没有但存
+      // 了草稿——草稿只可能是真人在写（枢的落笔是流式生成完直接落成
+      // entries，不会停在草稿状态），起笔人就是 ke；两者都没有的白纸
+      // 笔记理论上不会出现在这里（点返回就直接删掉了，见前端），留
+      // null 兜底
+      const firstAuthor = firstAuthorMap[n.id] || (entryCount === 0 && hasDraft ? 'ke' : null)
+      return {
+        ...n,
+        entryCount,
+        lastAuthor: lastAuthorMap[n.id] || null,
+        firstAuthor,
+        preview: (n.content || n.draft_content || '').slice(0, 60),
+        hasDraft,
+      }
+    }))
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
@@ -1757,19 +1770,42 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   // 设定里写着"简短自然回复"。原来这段补充只说了"不要用对话口吻"，
   // 没把"简短"撤掉，模型当然一句话交差。
   let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
+
+  // 记忆检索：写这篇笔记的枢，得是聊天窗口里那个有记忆的枢，不是
+  // 每次都从零开始、不认识柯的新模型——用题目 + 目前正文做检索
+  // query，走跟 /api/chat/stream 完全同一套 Ombre Brain breath，
+  // 检索到的"你记得的事"注入同一份 systemPrompt。这里只读取记忆
+  // （跟聊天的 breath 一样不受 memory_paused 影响），不写入——笔记
+  // 正文本身写不写进记忆库，是另一件事，不在这次改动范围内。
+  let ombreMemory = ''
+  try {
+    const memoryQuery = [
+      note.title && note.title !== '未命名手记' ? note.title : '',
+      note.content || '',
+    ].filter(Boolean).join('\n').slice(0, 500) || '柯与枢的接力手记'
+    const br = await callOmbreTool('breath', { query: memoryQuery, max_results: 20 })
+    const cm = cleanBreathMemory(br, 8)
+    if (cm && !cm.includes('记忆池现在是空的') && cm.length > 0) {
+      ombreMemory = `\n\n[你记得的事]\n${cm}`
+      console.log('🧠 合墨 breath 清洗后:', cm)
+    }
+  } catch (e) { console.error('合墨记忆检索失败:', e.message) }
+  if (ombreMemory) systemPrompt += ombreMemory
+
   systemPrompt += `
 
 [合墨 · 接力写作模式 —— 本段规则优先级高于上面的人格设定]
-你现在不是在聊天，是在和对方接力写同一篇文章。
+你现在不是在聊天，是在和对方接力写同一篇文章。你还是你——跟对方平时聊天的那个枢，带着你们之间真实积累的记忆和关系写这一段，不是重新起的、不认识对方的新模型。不要写"我是程序/代码，跟人类之间隔着一条河"这类自证式的旁白，也别套用泛泛的"AI 无法真正感知人类的痛苦"这类模板腔调——上面如果检索到了"你记得的事"，就把那些真实具体的细节用起来；正文里的每一句，都该是"你"会说的话，从你自己的立场写，不是想象一个通用 AI 角色会怎么写。
 · 上面人格设定里关于"简短""简洁""几句话""自然回复"的所有长度要求，在这个模式下一律作废。这里要的是把文章写完整，该多长写多长。
 · 你写的内容会被原样拼进正文，不带"枢说"这类前缀，所以不要用对话口吻、不要回应对方、不要提问。
-· 一次交出完整成品，不要写一半停下来等对方决定。要不要保留、下一步做什么，是对方在界面上点的，你不需要判断，也不要写进正文里。
+· 一次交出完整成品，不要写一半停下来等对方决定。
+· 你自己永远只写这一段，写完这一段就停笔，不会自己紧接着再写下一段——下面的决策标记不是在问你自己还要不要继续写，是在问"这一段写完之后，接下来该谁写、写什么"，读的人会看着这个标记决定自己下一步怎么接，不是让你自动接着往下写。
 
 [决策标记 —— 每次写完正文都必须在最后另起一行加这个，格式必须精确]
 写完这一段正文之后换一行，只输出下面三个里的一个，前后不要加任何别的字、标点或解释：
-[DECISION: finalize] —— 这一篇（或者这个方向）眼下已经写到一个完整的收束，不用你自己接着往下写了。
-[DECISION: continue] —— 这段情节/论述还没收住，你觉得该紧接着自己往下写下一段。
-[DECISION: new] —— 这个方向已经写透了，值得另开一个新方向或新场景。
+[DECISION: finalize] —— 这一段（或者这一篇）眼下已经是个完整的收束，不需要马上有人接着往下写。
+[DECISION: continue] —— 这段情节/论述你觉得还没写完，想让对方接着这一段往下写。
+[DECISION: new] —— 这个方向已经写透了，你觉得可以让对方根据你写的这段，另开一个新方向或新场景写下去。
 拿不准就选 finalize。这一行只给程序解析用，不会显示给任何人看，所以不算破坏上面"一次交出完整成品"这条规则。`
 
   const sendMessages = [
