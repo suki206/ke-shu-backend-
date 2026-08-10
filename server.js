@@ -1523,6 +1523,15 @@ function appendWithBreak(existing, delta) {
   return /\s$/.test(base) ? base + delta : `${base}\n\n${delta}`
 }
 
+// 把一篇笔记的 entries 按顺序整个重新拼成 content——正常落笔是"接在
+// 末尾"，但编辑中间某一条 entry 之后新旧文字长度不一样，没法再简单
+// 地在原 content 字符串里定位替换，只能按 entries 顺序整篇重新拼一遍
+function rebuildNoteContent(entries) {
+  let content = ''
+  for (const e of entries) content = appendWithBreak(content, e.content)
+  return content
+}
+
 // 笔记列表：预览取正文（没正文就退而取草稿），附带段落数、是否有
 // 未完成草稿、以及最后一条 entries 的作者——列表页拿最后这个字段
 // 判断"轮到谁写"，不用另外为每篇笔记去拉全部 entries
@@ -1685,6 +1694,34 @@ app.delete('/api/notes/:id/last-entry', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
+// 编辑一条自己写的段落：只有 author='ke' 的 entry 允许改，枢写的段落
+// 不给改。改完之后正文不能简单地在原字符串里定位替换（新旧内容长度
+// 不一样），得按 entries 顺序把整篇 content 重新拼一遍。
+app.put('/api/notes/:id/entries/:entryId', async (req, res) => {
+  try {
+    const { id, entryId } = req.params
+    const { content } = req.body || {}
+    if (!content || !content.trim()) return res.status(400).json({ error: '内容不能为空' })
+
+    const { data: entry, error: ee } = await supabase.from('entries')
+      .select('id,note_id,author').eq('id', entryId).single()
+    if (ee || !entry || entry.note_id !== id) return res.status(404).json({ error: '段落不存在' })
+    if (entry.author !== 'ke') return res.status(403).json({ error: '枢写的段落不能改' })
+
+    const { error: ue } = await supabase.from('entries').update({ content }).eq('id', entryId)
+    if (ue) return res.status(500).json({ error: ue.message })
+
+    const { data: allEntries, error: ae } = await supabase.from('entries')
+      .select('content').eq('note_id', id).order('created_at', { ascending: true })
+    if (ae) return res.status(500).json({ error: ae.message })
+
+    const rebuilt = rebuildNoteContent(allEntries || [])
+    await supabase.from('notes').update({ content: rebuilt, updated_at: new Date().toISOString() }).eq('id', id)
+
+    res.json({ success: true, content: rebuilt })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
 // ── 生成上下文拼装 ─────────────────────────────────────────────
 // continue：把 note.content 整篇喂给模型，要求接着写下一段，语气/
 // 节奏衔接上一段；new：同样给整篇正文供参考，但明确要求另起一段
@@ -1697,13 +1734,15 @@ function buildInkUserPrompt(mode, note) {
 
   // 原来这里写的是"请你写下一段"——要求一段，模型自然就交一段，
   // 前文说好"说六句话"、真人写了三句，它也只补一句。改成明确要求
-  // 读懂前文定下的结构，把缺口一次性补齐。
-  const finishRule = [
+  // 读懂前文定下的结构，把缺口一次性补齐。排版也不再限制成一整块
+  // 大长段——写多长、分不分段、要不要穿插对话，交给内容本身的
+  // 节奏决定；另外加了一条"不编细节"，专门压幻觉。
+  const baseRules = [
     '写作要求：',
     '1. 先读懂前文给这一篇定下的整体结构和篇幅约定。如果前文明确或隐含了数量（要说六句、写三段、五个场景、"第一次/第二次/第三次"这类排序），把还缺的部分一次性全部补齐——缺三句就写三句，不要只写一句就停。',
     '2. 如果前文没有数量约定，就按它自己的节奏把这一篇写到一个完整的收束，不要停在半路。',
-    '3. 语气、人称、句式长度、断句方式、用不用标点，全部跟前文保持一致，读起来要像同一个人一口气写下来的。',
-    '4. 不要复述或改写前文已有的内容，直接从断掉的地方往下接。',
+    '3. 排版不设限制——该分段就分段，该空行就空行，长短句怎么搭配、要不要用对话都由内容本身的节奏决定，唯一要避免的是不管写多长都挤成一整块不分段的大长段。',
+    '4. 只写你确实从前文、或者上面"你记得的事"里读到的具体细节——没有依据的人名、事件、约定不要凭空编，宁可写得克制、留白，也不要为了显得具体而编造。',
     '5. 只输出正文本身：没有开场白、没有解释、没有署名、没有"好的""我来续写"这类话，也不要自己加标题或编号（前文本来就有编号的除外）。',
   ].join('\n')
 
@@ -1714,9 +1753,9 @@ function buildInkUserPrompt(mode, note) {
 ${doc}
 
 【你的任务】
-接着最后一个字往下写，把这一篇补完整。
+接着最后一个字往下写，把这一篇补完整——语气、人称、句式长度、断句方式，全部跟前文保持一致，读起来要像同一个人一口气写下来的；不要复述或改写前文已有的内容，直接从断掉的地方往下接。
 
-${finishRule}`
+${baseRules}`
   }
   if (mode === 'new') {
     return `这是你们俩接力在写的同一篇文章，标题「${title}」。
@@ -1725,16 +1764,16 @@ ${finishRule}`
 ${doc}
 
 【你的任务】
-基于同样的主题另起一个新的方向或场景，不必承接上一段的具体情节，但要写成完整的一段内容。
+这不是接着往下写，是另起一段独立的内容——换一个角度、场景或切入点，甚至可以换一种体裁（前面是叙事，这一段可以是一封信、一段对话、一则短札……只要还是同一个主题下的东西）。不要延续前一段没写完的具体情节或动作，读者要一眼看出这是新起的一段，不是紧跟着往下写的。
 
-${finishRule}`
+${baseRules}`
   }
   return `这是一篇新文章，标题「${title}」，现在还是白纸一张。
 
 【你的任务】
 由你起笔，写出完整的一篇，不是只写个开头。
 
-${finishRule}`
+${baseRules}`
 }
 
 // ── 枢决策标记 ──────────────────────────────────────────────
@@ -1888,12 +1927,34 @@ async function runInkStream({ req, res, send, noteId, mode }) {
     content: appendWithBreak(note.content, cleanText), updated_at: now,
   }).eq('id', noteId)
 
+  // 枢起笔（白纸一张、由他写第一段）的话，标题也该由他来起，不用
+  // 真人再手动填——只在标题还是默认值时才生成，不覆盖真人已经自己
+  // 起过的标题。走的是跟聊天会话自动标题同一套小模型、低 token 调用。
+  let autoTitle = null
+  if (mode === 'original' && (!note.title || note.title === '未命名手记')) {
+    try {
+      const tr = await fetch(DEEPSEEK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: [{ role: 'system', content: '你是一个标题生成助手。根据这篇笔记正文，生成一个简短的标题（不超过12个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `正文：${cleanText.slice(0, 400)}\n请生成标题：` }],
+          temperature: 0.5, max_tokens: 20,
+        }),
+      })
+      const td = await tr.json()
+      autoTitle = td.choices?.[0]?.message?.content?.trim().slice(0, 20) || null
+      if (autoTitle) await supabase.from('notes').update({ title: autoTitle }).eq('id', noteId)
+    } catch (e) { console.error('合墨自动标题失败:', e.message) }
+  }
+
   if (clientAborted || res.writableEnded) return
   send({
     done: true, content: cleanText,
     entryId: saved?.[0]?.id,
     truncated: clientAborted || wasCut,
     decision,
+    autoTitle,
     tokens: usage ? { input: usage.prompt_tokens, output: usage.completion_tokens } : null,
   })
   res.end()
