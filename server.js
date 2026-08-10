@@ -94,9 +94,10 @@ async function callOmbreTool(toolName, args = {}) {
 }
 
 // ── 记忆库的删除能力 ─────────────────────────────────────────
-// 落笔会把内容 grow 进记忆桶；那段被删掉时，记忆桶里的那一份也得跟着
-// 消失，否则枢还会"记得"一段已经不存在的文字。不同版本的 Ombre Brain
-// 删除工具叫法不一样，这里先探测一次工具清单再对号入座。
+// 合墨已经不再往记忆桶里 grow/forget 任何东西（见下方笔记相关接口），
+// 这一段工具探测目前只服务 /api/ombre/tools 这个诊断接口，以及对话
+// 那边如果将来也需要按名字匹配删除工具时复用。不同版本的 Ombre
+// Brain 删除工具叫法不一样，这里先探测一次工具清单再对号入座。
 let ombreToolCache = null
 async function listOmbreTools() {
   if (!OMBRE_BRAIN_URL) return []
@@ -132,27 +133,8 @@ async function resolveForgetTool() {
   return ombreForgetTool
 }
 
-// grow 的回执里一般带着 bucket_id / id，抓出来存进 entries.memory_ref，
-// 以后删段落时凭它找到对应的记忆
-function extractMemoryRef(growResult) {
-  if (!growResult) return null
-  const s = typeof growResult === 'string' ? growResult : JSON.stringify(growResult)
-  const m = s.match(/bucket_id["':\s]*([A-Za-z0-9_-]{6,})/i)
-        || s.match(/\b(mem_[A-Za-z0-9_-]+)\b/i)
-        || s.match(/"id"\s*:\s*"([A-Za-z0-9_-]{6,})"/i)
-  return m ? m[1] : null
-}
-
-async function growAndRemember(entryId, content, tags = []) {
-  try {
-    const r = await callOmbreTool('grow', { content, tags })
-    console.log('🧠 合墨 grow 归档完成:', r)
-    const ref = extractMemoryRef(r)
-    if (ref && entryId) await supabase.from('entries').update({ memory_ref: ref }).eq('id', entryId)
-  } catch (e) { console.error('合墨 grow 失败:', e.message) }
-}
-
-// 参数名各家不同，挨个试一遍，能删掉就算
+// 参数名各家不同，挨个试一遍，能删掉就算——目前没有调用方了（合墨
+// 已经不再往记忆桶写东西），留着给对话那边以后要按名字删除时复用
 async function forgetOmbreMemory(ref) {
   if (!OMBRE_BRAIN_URL || !ref) return false
   const tool = await resolveForgetTool()
@@ -1520,8 +1502,8 @@ app.get('/api/stats/tokens', async (req, res) => {
 // 和给枢写的片段打徽标。
 // 草稿（draft_*）是"还没落笔的尾巴"：用户正在续写、还没点『落笔』
 // 或『让他写』之前的这一小段，退出笔记会原样保留，重进笔记会把它
-// 接回正文末尾继续写；落笔之后才追加进 content、写进 entries、
-// 同步进 Ombre Brain。
+// 接回正文末尾继续写；落笔之后才追加进 content、写进 entries——
+// 只落 Supabase，不再往 Ombre Brain 记忆库归档任何东西。
 // 三个选项（自存/让他续写/另起一篇）由真人在一个居中弹层里一次性
 // 选定、立即执行，不循环——枢写完就完了，不会自动又弹出一轮同样
 // 的选择；枢写完后前端只给"保留/删除这段"这一个轻量的事后动作。
@@ -1542,7 +1524,8 @@ function appendWithBreak(existing, delta) {
 }
 
 // 笔记列表：预览取正文（没正文就退而取草稿），附带段落数、是否有
-// 未完成草稿——列表页不需要拉全文
+// 未完成草稿、以及最后一条 entries 的作者——列表页拿最后这个字段
+// 判断"轮到谁写"，不用另外为每篇笔记去拉全部 entries
 app.get('/api/notes', async (req, res) => {
   try {
     const { data: notes, error } = await supabase.from('notes').select('*').order('updated_at', { ascending: false })
@@ -1551,13 +1534,19 @@ app.get('/api/notes', async (req, res) => {
 
     const ids = notes.map(n => n.id)
     const { data: allEntries } = await supabase.from('entries')
-      .select('note_id').in('note_id', ids)
-    const countMap = {}
-    allEntries?.forEach(e => { countMap[e.note_id] = (countMap[e.note_id] || 0) + 1 })
+      .select('note_id,author').in('note_id', ids).order('created_at', { ascending: true })
+    const countMap = {}, lastAuthorMap = {}
+    // 按创建时间正序遍历，同一个 note_id 后写入的会覆盖前面的，
+    // 遍历完 lastAuthorMap 里存的自然就是每篇笔记最新一条的作者
+    allEntries?.forEach(e => {
+      countMap[e.note_id] = (countMap[e.note_id] || 0) + 1
+      lastAuthorMap[e.note_id] = e.author
+    })
 
     res.json(notes.map(n => ({
       ...n,
       entryCount: countMap[n.id] || 0,
+      lastAuthor: lastAuthorMap[n.id] || null,
       preview: (n.content || n.draft_content || '').slice(0, 60),
       hasDraft: !!(n.draft_content && n.draft_content.trim()),
     })))
@@ -1577,9 +1566,14 @@ app.post('/api/notes/new', async (req, res) => {
 app.put('/api/notes/:id', async (req, res) => {
   try {
     const { id } = req.params
-    const { title } = req.body
+    const { title, board, pinned } = req.body
     const patch = { updated_at: new Date().toISOString() }
-    if (title !== undefined) patch.title = title
+    if (title   !== undefined) patch.title      = title
+    // board 传空字符串/null 都算"移出板块，回到全部"
+    if (board   !== undefined) patch.board      = board || null
+    // pinned 是个动作型布尔值，不是真的时间戳——前端不用自己拼时间，
+    // 置顶了几点几分只在这一层决定，取消置顶就把它清成 null
+    if (pinned  !== undefined) patch.pinned_at  = pinned ? new Date().toISOString() : null
     const { data, error } = await supabase.from('notes').update(patch).eq('id', id).select()
     if (error) return res.status(500).json({ error: error.message })
     res.json(data[0])
@@ -1589,11 +1583,6 @@ app.put('/api/notes/:id', async (req, res) => {
 app.delete('/api/notes/:id', async (req, res) => {
   try {
     const { id } = req.params
-    // 先把这一篇每次落笔留在记忆桶里的那份挨个撤掉，再删笔记本体，
-    // 否则笔记没了、记忆还在，枢会"记得"一段已经不存在的文字
-    const { data: rows } = await supabase.from('entries').select('memory_ref').eq('note_id', id)
-    for (const r of rows || []) { if (r.memory_ref) await forgetOmbreMemory(r.memory_ref) }
-
     // entries 表 note_id 外键建了 on delete cascade，删 notes 会自动带走
     const { error } = await supabase.from('notes').delete().eq('id', id)
     if (error) return res.status(500).json({ error: error.message })
@@ -1610,7 +1599,7 @@ app.get('/api/notes/:id/entries', async (req, res) => {
     const { data: note, error: ne } = await supabase.from('notes').select('*').eq('id', id).single()
     if (ne) return res.status(500).json({ error: ne.message })
     const { data: entries, error: ee } = await supabase.from('entries')
-      .select('id,author,mode,content,created_at,model,tokens_input,tokens_output,truncated')
+      .select('id,author,mode,content,created_at,model,tokens_input,tokens_output,truncated,decision')
       .eq('note_id', id).order('created_at', { ascending: true })
     if (ee) return res.status(500).json({ error: ee.message })
     res.json({ note, entries: entries || [] })
@@ -1642,7 +1631,7 @@ app.post('/api/notes/:id/entries', async (req, res) => {
     const useMode = INK_MODES.includes(mode) ? mode : 'original'
     const now = new Date().toISOString()
 
-    const { data: noteRow, error: fe } = await supabase.from('notes').select('content,tags').eq('id', id).single()
+    const { data: noteRow, error: fe } = await supabase.from('notes').select('content').eq('id', id).single()
     if (fe || !noteRow) return res.status(404).json({ error: '笔记不存在' })
 
     const { data: saved, error } = await supabase.from('entries')
@@ -1653,9 +1642,6 @@ app.post('/api/notes/:id/entries', async (req, res) => {
       content: appendWithBreak(noteRow.content, content),
       draft_content: null, draft_mode: null, draft_updated_at: null, updated_at: now,
     }).eq('id', id)
-
-    // 归档进记忆桶，并把回执里的引用记在这条 entry 上（将来删这段能一起删）
-    if (OMBRE_BRAIN_URL) growAndRemember(saved[0].id, content, noteRow.tags || [])
 
     res.json(saved[0])
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1668,14 +1654,11 @@ app.delete('/api/notes/:id/last-entry', async (req, res) => {
   try {
     const { id } = req.params
     const { data: last, error: le } = await supabase.from('entries')
-      .select('id,content,memory_ref').eq('note_id', id).order('created_at', { ascending: false }).limit(1).single()
+      .select('id,content').eq('note_id', id).order('created_at', { ascending: false }).limit(1).single()
     if (le || !last) return res.status(404).json({ error: '没有可删除的段落' })
 
     const { data: noteRow, error: ne } = await supabase.from('notes').select('content').eq('id', id).single()
     if (ne || !noteRow) return res.status(404).json({ error: '笔记不存在' })
-
-    // 记忆桶里的那一份跟着一起消失
-    if (last.memory_ref) await forgetOmbreMemory(last.memory_ref)
 
     const { error: de } = await supabase.from('entries').delete().eq('id', last.id)
     if (de) return res.status(500).json({ error: de.message })
@@ -1741,8 +1724,26 @@ ${finishRule}`
 ${finishRule}`
 }
 
+// ── 枢决策标记 ──────────────────────────────────────────────
+// 枢每次写完都要在正文最后单独一行交出 [DECISION: finalize/continue/new]，
+// 前端/后端都不展示这一行——后端把它从正文里剥掉存进 entries.decision，
+// 前端拿这个字段决定要不要自动接着流转下去。
+// DECISION_TAIL_HOLD：流式转发时尾部留几个字符不发，等这几个字符
+// 到齐了再一次性判断是不是标记——这段一律不会被转发到前端屏幕上，
+// 所以留多一点也没关系，只要盖得住最长的 [DECISION: continue] 加前面
+// 可能带的换行/空格就够
+const DECISION_RE = /\[\s*DECISION\s*:\s*(finalize|continue|new)\s*\]\s*$/i
+const DECISION_TAIL_HOLD = 32
+function extractDecision(text) {
+  const t = (text || '').replace(/\s+$/, '')
+  const m = t.match(DECISION_RE)
+  if (!m) return { content: t, decision: null }
+  return { content: t.slice(0, m.index).replace(/\s+$/, ''), decision: m[1].toLowerCase() }
+}
+
 // ── 枢写一段（SSE 流式，与 /api/chat/stream 同一套读法）────────
-// token 实时转发，没有需要剥离的标记，不用做尾部缓冲
+// token 实时转发，但尾部留一小截缓冲——留出剥离 [DECISION: ...] 标记
+// 的空间，不让这行调试用的标记闪现在正在流式浮现的文字里
 async function runInkStream({ req, res, send, noteId, mode }) {
   const { data: note } = await supabase.from('notes').select('*').eq('id', noteId).single()
   if (!note) { send({ error: '笔记不存在' }); return res.end() }
@@ -1762,18 +1763,14 @@ async function runInkStream({ req, res, send, noteId, mode }) {
 你现在不是在聊天，是在和对方接力写同一篇文章。
 · 上面人格设定里关于"简短""简洁""几句话""自然回复"的所有长度要求，在这个模式下一律作废。这里要的是把文章写完整，该多长写多长。
 · 你写的内容会被原样拼进正文，不带"枢说"这类前缀，所以不要用对话口吻、不要回应对方、不要提问。
-· 一次交出完整成品，不要写一半停下来等对方决定。要不要保留、下一步做什么，是对方在界面上点的，你不需要判断，也不要写进正文里。`
+· 一次交出完整成品，不要写一半停下来等对方决定。要不要保留、下一步做什么，是对方在界面上点的，你不需要判断，也不要写进正文里。
 
-  // Ombre Brain 召回：标题 + 正文结尾一小段做检索 query
-  const tailForQuery = (note.content || '').slice(-200)
-  const recallQuery = [note.title, tailForQuery].filter(Boolean).join(' ').slice(0, 300) || '合墨'
-  let ombreMemory = ''
-  try {
-    const br = await callOmbreTool('breath', { query: recallQuery, max_results: 20 })
-    const cm = cleanBreathMemory(br, 8)
-    if (cm && !cm.includes('记忆池现在是空的') && cm.length > 0) ombreMemory = `\n\n[你记得的事]\n${cm}`
-  } catch (e) { console.error('合墨记忆检索失败:', e.message) }
-  if (ombreMemory) systemPrompt += ombreMemory
+[决策标记 —— 每次写完正文都必须在最后另起一行加这个，格式必须精确]
+写完这一段正文之后换一行，只输出下面三个里的一个，前后不要加任何别的字、标点或解释：
+[DECISION: finalize] —— 这一篇（或者这个方向）眼下已经写到一个完整的收束，不用你自己接着往下写了。
+[DECISION: continue] —— 这段情节/论述还没收住，你觉得该紧接着自己往下写下一段。
+[DECISION: new] —— 这个方向已经写透了，值得另开一个新方向或新场景。
+拿不准就选 finalize。这一行只给程序解析用，不会显示给任何人看，所以不算破坏上面"一次交出完整成品"这条规则。`
 
   const sendMessages = [
     { role: 'system', content: systemPrompt },
@@ -1786,6 +1783,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   req.on('close', onClose)
 
   let fullText = '', usage = null, finishReason = null
+  let sentLen = 0 // 已经转发给前端的字符数——尾部固定留 DECISION_TAIL_HOLD 个字不发
 
   try {
     const aiRes = await fetch(activeModel.baseUrl, {
@@ -1819,7 +1817,11 @@ async function runInkStream({ req, res, send, noteId, mode }) {
           try {
             const ev = JSON.parse(t.slice(6))
             const delta = ev.choices?.[0]?.delta
-            if (delta?.content) { fullText += delta.content; send({ token: delta.content }) }
+            if (delta?.content) {
+              fullText += delta.content
+              const safeLen = Math.max(0, fullText.length - DECISION_TAIL_HOLD)
+              if (safeLen > sentLen) { send({ token: fullText.slice(sentLen, safeLen) }); sentLen = safeLen }
+            }
             if (ev.choices?.[0]?.finish_reason) finishReason = ev.choices[0].finish_reason
             if (ev.usage) usage = ev.usage
           } catch {}
@@ -1832,7 +1834,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
     req.off('close', onClose)
   }
 
-  const cleanText = fullText.trim()
+  const { content: cleanText, decision } = extractDecision(fullText)
   if (!cleanText) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
 
   const wasCut = finishReason === 'length'   // 撞到 max_tokens 才算截断
@@ -1840,6 +1842,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   const { data: saved } = await supabase.from('entries').insert([{
     note_id: noteId, author: 'shu', mode, content: cleanText, created_at: now,
     truncated: clientAborted || wasCut || null,
+    decision,
     tokens_input:  usage ? usage.prompt_tokens     : null,
     tokens_output: usage ? usage.completion_tokens : null,
     model: activeModel.id,
@@ -1849,15 +1852,12 @@ async function runInkStream({ req, res, send, noteId, mode }) {
     content: appendWithBreak(note.content, cleanText), updated_at: now,
   }).eq('id', noteId)
 
-  if (OMBRE_BRAIN_URL && saved?.[0]?.id) {
-    growAndRemember(saved[0].id, cleanText, note.tags || [])
-  }
-
   if (clientAborted || res.writableEnded) return
   send({
     done: true, content: cleanText,
     entryId: saved?.[0]?.id,
     truncated: clientAborted || wasCut,
+    decision,
     tokens: usage ? { input: usage.prompt_tokens, output: usage.completion_tokens } : null,
   })
   res.end()
