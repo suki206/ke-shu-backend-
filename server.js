@@ -327,7 +327,7 @@ function resolveModel(cfg, modelId) {
   if (!found) {
     // 找不到配置（全新安装、cfg.model 为空、被删掉、或是旧版本残留的
     // 已失效模型名）就兜底到一个确定能跑的默认值，不让聊天直接失败
-    return { id: BUILTIN_MODEL_ID, label: 'DeepSeek · V4 Flash', baseUrl: DEEPSEEK_URL, requestModel: 'deepseek-v4-flash', apiKey: process.env.DEEPSEEK_API_KEY }
+    return { id: BUILTIN_MODEL_ID, label: 'DeepSeek · V4 Flash', baseUrl: DEEPSEEK_URL, requestModel: 'deepseek-v4-flash', apiKey: process.env.DEEPSEEK_API_KEY, protocol: 'openai' }
   }
   const apiKey = found.apiKey
     || (found.providerId === 'deepseek' ? process.env.DEEPSEEK_API_KEY : '')
@@ -339,7 +339,135 @@ function resolveModel(cfg, modelId) {
     baseUrl: found.baseUrl || DEEPSEEK_URL,
     requestModel: found.requestModel || found.id,
     apiKey,
+    // 'openai' = OpenAI 兼容协议（DeepSeek/Moonshot/Qwen/GLM 等绝大多数
+    // 国内模型走这条，也是没显式设置时的默认值，保证老数据不用迁移）；
+    // 'anthropic' = Anthropic 官方原生协议（Claude），见下面 buildChatRequest
+    // / parseChatCompletion / parseStreamEvent 三个函数的协议分支
+    protocol: found.protocol === 'anthropic' ? 'anthropic' : 'openai',
   }
+}
+
+// ============================================================
+// 多协议适配层——OpenAI 兼容 vs Anthropic 原生
+// 2026-08-11 新增：这套代码原来假设所有接入的模型都是 OpenAI 兼容协议
+// （resolveModel 顶部注释早就写明这个假设），DeepSeek/Moonshot/Qwen/GLM
+// 之类国内主流模型基本都照抄这套协议，能直接用；但 Anthropic 官方
+// /v1/messages 接口是完全不同的形状：
+//   · system 提示词是独立顶层字段，不能塞进 messages 数组
+//   · 鉴权是 x-api-key 请求头，不是 Authorization: Bearer，还多需要一个
+//     anthropic-version 请求头
+//   · max_tokens 是必填项（OpenAI 协议里选填）
+//   · 思考模式叫 extended thinking，参数形状是 {type:'enabled',
+//     budget_tokens}，跟 DeepSeek 的 {type:'enabled'|'disabled'} 不一样；
+//     开启时官方要求 temperature 必须是 1（跟 DeepSeek "思考时 temperature
+//     不生效"是类似限制，这里直接照做，不留一个会报错的组合）
+//   · 流式返回不是简单的 choices[0].delta，而是一串有名字的事件
+//     （message_start / content_block_delta / message_delta 等），文本增量
+//     在 content_block_delta 里按 delta.type 区分是正文(text_delta)还是
+//     思考(thinking_delta)；usage 也是分两段给：message_start 给
+//     input_tokens，message_delta 给累计的 output_tokens
+//   · 非流式响应的正文是 content: [{type:'text', text:'...'}, ...] 数组，
+//     不是 choices[0].message.content 那样的单一字符串
+// 下面三个函数是这层适配的全部——resolveModel 决定协议，
+// buildChatRequest 按协议拼请求，parseChatCompletion / parseStreamEvent
+// 按协议解析非流式/流式响应，五处真正调用模型的地方（/api/chat、
+// runAssistantStream、/api/chat/regenerate、generateDiaryForDate、
+// runInkStream）都只认这三个函数返回的统一形状，不用各自分别判断协议。
+// ============================================================
+const ANTHROPIC_VERSION = '2023-06-01'
+const ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+const ANTHROPIC_THINKING_BUDGET = 2000
+const ANTHROPIC_CHAT_URL = 'https://api.anthropic.com/v1/messages'
+const ANTHROPIC_MODELS_URL = 'https://api.anthropic.com/v1/models'
+
+// 组装这次调用要发的 { url, headers, body }。system 和 messages（不含
+// system 那条）分开传入，两种协议各自决定 system 该塞在哪。
+function buildChatRequest(activeModel, { system, messages, temperature, thinkingEnabled, stream, maxTokens }) {
+  if (activeModel.protocol === 'anthropic') {
+    const body = {
+      model: activeModel.requestModel,
+      system,
+      messages,
+      max_tokens: maxTokens || ANTHROPIC_DEFAULT_MAX_TOKENS,
+      // 思考模式开启时官方要求 temperature 必须是 1，不能沿用用户设置的值
+      temperature: thinkingEnabled ? 1 : Number(temperature),
+      stream: !!stream,
+    }
+    if (thinkingEnabled) {
+      body.thinking = { type: 'enabled', budget_tokens: Math.min(ANTHROPIC_THINKING_BUDGET, body.max_tokens - 1) }
+    }
+    return {
+      url: activeModel.baseUrl || ANTHROPIC_CHAT_URL,
+      headers: { 'Content-Type': 'application/json', 'x-api-key': activeModel.apiKey, 'anthropic-version': ANTHROPIC_VERSION },
+      body,
+    }
+  }
+  // openai 兼容协议（默认）——跟原来的拼法完全一致，只是从"内联写在
+  // 五个调用点各自的 fetch 里"搬到了这一个共用函数里
+  const body = {
+    model: activeModel.requestModel,
+    messages: [{ role: 'system', content: system }, ...messages],
+    temperature: Number(temperature),
+    ...deepseekThinking(activeModel.requestModel, thinkingEnabled),
+  }
+  if (maxTokens) body.max_tokens = maxTokens
+  if (stream) { body.stream = true; body.stream_options = { include_usage: true } }
+  return {
+    url: activeModel.baseUrl,
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
+    body,
+  }
+}
+
+// 非流式响应统一解析成 { text, reasoning, usage: {prompt_tokens,
+// completion_tokens} }；解析不出正文时返回 null，调用方按原来的方式报错。
+function parseChatCompletion(activeModel, aiData) {
+  if (activeModel.protocol === 'anthropic') {
+    const blocks = aiData.content || []
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
+    const reasoning = blocks.filter(b => b.type === 'thinking').map(b => b.thinking).join('') || null
+    if (!text && !reasoning) return null
+    return {
+      text, reasoning,
+      usage: aiData.usage ? { prompt_tokens: aiData.usage.input_tokens, completion_tokens: aiData.usage.output_tokens } : null,
+    }
+  }
+  if (!aiData.choices?.[0]) return null
+  return {
+    text: aiData.choices[0].message.content,
+    reasoning: aiData.choices[0].message.reasoning_content || null,
+    usage: aiData.usage || null,
+  }
+}
+
+// 流式响应逐条 SSE 事件解析。usageRef 是个 { current } 包装对象，因为两种
+// 协议的 usage 都是分好几个事件给的，要跨事件累积，用引用传递方便调用方
+// 在循环外一次性拿最终值。返回 { token?, reasoning?, truncated? }——
+// truncated 归一化了两种协议里"撞到 max_tokens 截断"的判断（OpenAI 是
+// finish_reason==='length'，Anthropic 是 message_delta.delta.stop_reason
+// ==='max_tokens'），只有 runInkStream 用得到这个字段。
+function parseStreamEvent(protocol, ev, usageRef) {
+  if (protocol === 'anthropic') {
+    if (ev.type === 'message_start') {
+      usageRef.current = { prompt_tokens: ev.message?.usage?.input_tokens || 0, completion_tokens: 0 }
+      return {}
+    }
+    if (ev.type === 'message_delta') {
+      if (ev.usage) usageRef.current = { prompt_tokens: usageRef.current?.prompt_tokens || 0, completion_tokens: ev.usage.output_tokens || 0 }
+      return { truncated: ev.delta?.stop_reason === 'max_tokens' }
+    }
+    if (ev.type === 'content_block_delta') {
+      if (ev.delta?.type === 'text_delta') return { token: ev.delta.text }
+      if (ev.delta?.type === 'thinking_delta') return { reasoning: ev.delta.thinking }
+    }
+    return {}
+  }
+  // openai 兼容协议（默认）
+  const delta = ev.choices?.[0]?.delta
+  if (ev.usage) usageRef.current = ev.usage
+  const result = { token: delta?.content, reasoning: delta?.reasoning_content }
+  if (ev.choices?.[0]?.finish_reason) result.truncated = ev.choices[0].finish_reason === 'length'
+  return result
 }
 
 // ============================================================
@@ -530,27 +658,44 @@ app.post('/api/settings', async (req, res) => {
 // https://api-docs.deepseek.com/api/list-models/），前端拿到 id 列表
 // 后做勾选，勾中的才会真正写进 cfg.models。放在后端代理而不是前端
 // 直接请求：一是避免浏览器端跨域，二是密钥不用经浏览器直连第三方。
+//
+// 2026-08-11 加了 protocol 参数：Anthropic 原生协议的模型列表接口
+// 跟 OpenAI 兼容那套不是同一回事——地址不是"把 chat 端点的路径换成
+// /models"能推出来的（Anthropic 的 chat 端点是 /v1/messages，不是
+// /chat/completions，替换规则套不上），鉴权也是 x-api-key + 那个额外
+// 的 anthropic-version 请求头，不是 Bearer。返回形状恰好也是
+// { data: [{id, ...}] }，跟 OpenAI 兼容那套一样能直接复用下面的
+// map(m => ({id, ownedBy}))，只是 Anthropic 没有 owned_by 字段，
+// ownedBy 会是空字符串，无害。
 // ============================================================
 app.post('/api/models/discover', async (req, res) => {
   try {
-    const { baseUrl, apiKey, providerId } = req.body || {}
+    const { baseUrl, apiKey, providerId, protocol } = req.body || {}
     if (!baseUrl) return res.status(400).json({ error: '缺少接口地址' })
 
-    // baseUrl 存的是 chat/completions 端点（如 .../v1/chat/completions
-    // 或 .../chat/completions），模型列表跟它同源、把这一段换成 /models
-    let modelsUrl
-    try {
-      modelsUrl = baseUrl.replace(/\/chat\/completions\/?$/i, '').replace(/\/+$/, '') + '/models'
-    } catch { return res.status(400).json({ error: '接口地址格式不对' }) }
+    let modelsUrl, headers
 
-    // 没填 key 时，DeepSeek 这个提供商允许退回环境变量（跟实际聊天调用
-    // 的兜底逻辑一致）；其它自定义提供商没填 key 就是真没有，不瞎猜
-    let isDeepSeek = providerId === 'deepseek'
-    try { isDeepSeek = isDeepSeek || /(^|\.)api\.deepseek\.com$/i.test(new URL(modelsUrl).hostname) } catch {}
-    const key = apiKey || (isDeepSeek ? process.env.DEEPSEEK_API_KEY : '') || ''
-    if (!key) return res.status(400).json({ error: '没有可用的 API Key' })
+    if (protocol === 'anthropic') {
+      if (!apiKey) return res.status(400).json({ error: '没有可用的 API Key' })
+      modelsUrl = ANTHROPIC_MODELS_URL
+      headers = { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION }
+    } else {
+      // baseUrl 存的是 chat/completions 端点（如 .../v1/chat/completions
+      // 或 .../chat/completions），模型列表跟它同源、把这一段换成 /models
+      try {
+        modelsUrl = baseUrl.replace(/\/chat\/completions\/?$/i, '').replace(/\/+$/, '') + '/models'
+      } catch { return res.status(400).json({ error: '接口地址格式不对' }) }
 
-    const r = await fetch(modelsUrl, { headers: { 'Authorization': `Bearer ${key}` } })
+      // 没填 key 时，DeepSeek 这个提供商允许退回环境变量（跟实际聊天调用
+      // 的兜底逻辑一致）；其它自定义提供商没填 key 就是真没有，不瞎猜
+      let isDeepSeek = providerId === 'deepseek'
+      try { isDeepSeek = isDeepSeek || /(^|\.)api\.deepseek\.com$/i.test(new URL(modelsUrl).hostname) } catch {}
+      const key = apiKey || (isDeepSeek ? process.env.DEEPSEEK_API_KEY : '') || ''
+      if (!key) return res.status(400).json({ error: '没有可用的 API Key' })
+      headers = { 'Authorization': `Bearer ${key}` }
+    }
+
+    const r = await fetch(modelsUrl, { headers })
     if (!r.ok) {
       const t = await r.text()
       return res.status(502).json({ error: `获取模型列表失败（HTTP ${r.status}）：${t.slice(0, 200)}` })
@@ -855,26 +1000,24 @@ app.post('/api/chat', async (req, res) => {
     // 6. 可见历史
     const { data: visHist } = await supabase.from('messages').select('role,content').eq('session_id', sessionId).eq('visible', true).order('created_at', { ascending: true })
 
-    // 7. 构建消息
-    const sendMessages = [{ role: 'system', content: systemPrompt }]
-    if (visHist?.length) sendMessages.push(...visHist.filter(m => m.content != null).map(m => ({ role: m.role, content: String(m.content) })))
+    // 7. 构建消息（system 单独传，两种协议各自决定塞在哪，见 buildChatRequest）
+    const chatMessages = (visHist || []).filter(m => m.content != null).map(m => ({ role: m.role, content: String(m.content) }))
 
     // 8. 调用主模型（尊重设置里选的模型，不再写死 deepseek-chat；
-    //    思考模式尊重输入栏"思考模式"开关，不再写死 true）
-    const aiRes = await fetch(activeModel.baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
-      body: JSON.stringify({
-        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
-        ...deepseekThinking(activeModel.requestModel, thinkingEnabled),
-      }),
+    //    思考模式尊重输入栏"思考模式"开关，不再写死 true；协议按
+    //    activeModel.protocol 走 OpenAI 兼容或 Anthropic 原生，见
+    //    buildChatRequest / parseChatCompletion）
+    const { url: chatUrl, headers: chatHeaders, body: chatBody } = buildChatRequest(activeModel, {
+      system: systemPrompt, messages: chatMessages, temperature, thinkingEnabled, stream: false,
     })
+    const aiRes = await fetch(chatUrl, { method: 'POST', headers: chatHeaders, body: JSON.stringify(chatBody) })
     const aiData = await aiRes.json()
-    if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
-    const replyText = aiData.choices[0].message.content
+    const parsed = parseChatCompletion(activeModel, aiData)
+    if (!parsed) return res.status(500).json({ error: aiData.error?.message || aiData.error?.type || 'AI 返回异常' })
+    const replyText = parsed.text
     // 非流式响应里，支持推理的模型通常把思考过程放在 message.reasoning_content
     // （跟流式的 delta.reasoning_content 是同一份数据，只是不分片），一并存下来
-    const replyReasoning = aiData.choices[0].message.reasoning_content || null
+    const replyReasoning = parsed.reasoning
 
     // 9. 保存 AI 回复（附带这次实际用的模型，供 Token 统计按模型拆分）
     const aiNow = new Date().toISOString()
@@ -970,15 +1113,14 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   //    让它读得到上下文，但不污染 messages 表里的原始正文）
   const { data: visHist } = await supabase.from('messages').select('role,content,quoted_text').eq('session_id', sessionId).eq('visible', true).order('created_at', { ascending: true })
 
-  // 6. 构建消息
-  const sendMessages = [{ role: 'system', content: systemPrompt }]
-  if (visHist?.length) sendMessages.push(...visHist.filter(m => m.content != null).map(m => ({
+  // 6. 构建消息（system 单独传，不塞进数组——两种协议各自决定放哪，见 buildChatRequest）
+  const chatMessages = (visHist || []).filter(m => m.content != null).map(m => ({
     role: m.role,
     content: m.quoted_text ? `[引用: ${m.quoted_text}]\n${m.content}` : String(m.content),
-  })))
+  }))
 
   // 7. 停止生成：前端 AbortController.abort() 会让这次 fetch 的连接关闭，
-  //    Node 侧的 req 会触发 'close'，据此中断与 DeepSeek 上游的连接。
+  //    Node 侧的 req 会触发 'close'，据此中断与上游模型的连接。
   const upstreamController = new AbortController()
   let clientAborted = false
   const onClose = () => {
@@ -990,20 +1132,17 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
 
   let fullText   = ''
   let reasoning  = ''
-  let usage      = null
+  let usageRef   = { current: null }
 
   try {
     // 8. 调用选中的模型（尊重常数页"模型切换"，stream: true，附带 usage 统计）
-    //    DeepSeek V4 思考模式尊重输入栏"思考模式"开关（cfg.show_reasoning）
-    //    ——见 deepseekThinking() 顶部注释，不再写死 enabled
-    const aiRes = await fetch(activeModel.baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
-      body: JSON.stringify({
-        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
-        stream: true, stream_options: { include_usage: true },
-        ...deepseekThinking(activeModel.requestModel, thinkingEnabled),
-      }),
+    //    思考模式尊重输入栏"思考模式"开关（cfg.show_reasoning）；协议按
+    //    activeModel.protocol 走 OpenAI 兼容或 Anthropic 原生
+    const { url: chatUrl, headers: chatHeaders, body: chatBody } = buildChatRequest(activeModel, {
+      system: systemPrompt, messages: chatMessages, temperature, thinkingEnabled, stream: true,
+    })
+    const aiRes = await fetch(chatUrl, {
+      method: 'POST', headers: chatHeaders, body: JSON.stringify(chatBody),
       signal: upstreamController.signal,
     })
 
@@ -1014,7 +1153,10 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
       return res.end()
     }
 
-    // 9. 流式转发 token（含 reasoning_content 折叠内容 与 usage）
+    // 9. 流式转发 token（含 reasoning_content 折叠内容 与 usage）——
+    //    两种协议的 SSE 都是 `data: {...}` 逐行给，外层这套按行拆分/
+    //    攒缓冲区的逻辑对两边都成立，只有"这个 JSON 事件是什么意思"
+    //    这一步按协议分支，交给 parseStreamEvent
     let buf = ''
     for await (const chunk of aiRes.body) {
       if (res.writableEnded) break
@@ -1026,11 +1168,10 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
         if (!t || t === 'data: [DONE]') continue
         if (t.startsWith('data: ')) {
           try {
-            const ev    = JSON.parse(t.slice(6))
-            const delta = ev.choices?.[0]?.delta
-            if (delta?.reasoning_content) { reasoning += delta.reasoning_content; send({ reasoning: delta.reasoning_content }) }
-            if (delta?.content)           { fullText  += delta.content;           send({ token: delta.content }) }
-            if (ev.usage) usage = ev.usage
+            const ev = JSON.parse(t.slice(6))
+            const { token, reasoning: reasoningDelta } = parseStreamEvent(activeModel.protocol, ev, usageRef)
+            if (reasoningDelta) { reasoning += reasoningDelta; send({ reasoning: reasoningDelta }) }
+            if (token)          { fullText  += token;          send({ token }) }
           } catch {}
         }
       }
@@ -1046,6 +1187,7 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   }
 
   if (clientAborted) console.log('⏹ 生成被用户中止，已保留部分内容，长度:', fullText.length)
+  const usage = usageRef.current
 
   // 10. 保存 AI 回复（含被中止时的部分内容；token 统计与中断标记写入真实字段；
   //     reasoning_content 是本轮新增：之前这里没存，思考过程只活在这一次
@@ -1211,26 +1353,23 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const lastMsg = allMessages[allMessages.length - 1]
     if (lastMsg.role !== 'assistant') return res.status(400).json({ error: '最后一条消息不是AI回复' })
 
-    const sendMessages = [{ role: 'system', content: withTimeAwareness(system_prompt, cfg.memo) }, ...allMessages.slice(0, -1).filter(m => m.content != null).map(m => ({ role: m.role, content: String(m.content) }))]
+    const chatMessages = allMessages.slice(0, -1).filter(m => m.content != null).map(m => ({ role: m.role, content: String(m.content) }))
 
-    const aiRes = await fetch(activeModel.baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
-      body: JSON.stringify({
-        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
-        ...deepseekThinking(activeModel.requestModel, thinkingEnabled),
-      }),
+    const { url: chatUrl, headers: chatHeaders, body: chatBody } = buildChatRequest(activeModel, {
+      system: withTimeAwareness(system_prompt, cfg.memo), messages: chatMessages, temperature, thinkingEnabled, stream: false,
     })
+    const aiRes = await fetch(chatUrl, { method: 'POST', headers: chatHeaders, body: JSON.stringify(chatBody) })
     const aiData = await aiRes.json()
-    if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
-    const replyText = aiData.choices[0].message.content
-    const replyReasoning = aiData.choices[0].message.reasoning_content || null
+    const parsed = parseChatCompletion(activeModel, aiData)
+    if (!parsed) return res.status(500).json({ error: aiData.error?.message || aiData.error?.type || 'AI 返回异常' })
+    const replyText = parsed.text
+    const replyReasoning = parsed.reasoning
     // Token 统计修复：这次重新生成实际调用了模型、真金白银花了 token，
     // 之前这里没读 aiData.usage，导致这条消息的 tokens_input/output
     // 一直停在"上一次生成"时的旧值——内容已经是新回复，token 数却对
     // 不上，Token 仪表盘（today/week/all/byModel/trend7d）算出来的数字
     // 因此是错的。现在跟流式那边一样，老老实实存这次真实的 usage。
-    const usage = aiData.usage || null
+    const usage = parsed.usage
 
     const now = new Date().toISOString()
     // 重新生成会覆盖这条消息原来的内容——旧的 reasoning 是对应旧回复的思考过程，
@@ -1307,21 +1446,17 @@ async function generateDiaryForDate(dateStr) {
   const convoText = dayMsgs.map(m => `${m.role === 'user' ? '他' : '我'}：${m.content}`).join('\n')
   const prompt = `[今天的对话]\n${convoText.slice(0, 6000)}\n\n以上是你和他今天的对话记录。现在不是在聊天，是你自己决定要不要为今天写一篇日记——这个决定完全由你自己判断，不是例行公事，也不用觉得"写了才算尽责"。\n\n如果今天大部分是些琐碎的、程序性的、你自己回头看也没什么特别想说的内容，直接选择不写就好，跳过和写日记同样正常，不需要为跳过找补理由，也不用为了"完成任务"硬凑一篇。\n如果今天有什么你真的想记下来的——一件事、一句话、一个情绪的转折——那就写。\n\n判断完之后：\n如果决定不写，只输出这一行，不要有任何其他文字：\n${DIARY_SKIP_MARKER}\n\n如果决定写，直接输出日记正文（不超过300字，第一人称、私密日记口吻，不要用"亲爱的日记"这类开头），不要输出上面的标记，也不要在正文前后加任何说明。`
 
-  const aiRes = await fetch(activeModel.baseUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
-    body: JSON.stringify({
-      model: activeModel.requestModel,
-      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }],
-      temperature: 0.9,
-      // 不转发 reasoning_content 给前端，思考模式只会白白多花思考 token、
-      // 还会让 temperature 失效——跟合墨接力写作那边关掉的理由一样
-      ...deepseekThinking(activeModel.requestModel, false),
-    }),
+  const { url: chatUrl, headers: chatHeaders, body: chatBody } = buildChatRequest(activeModel, {
+    system: systemPrompt, messages: [{ role: 'user', content: prompt }], temperature: 0.9,
+    // 不转发 reasoning_content 给前端，思考模式只会白白多花思考 token、
+    // 还会让 temperature 失效——跟合墨接力写作那边关掉的理由一样
+    thinkingEnabled: false, stream: false,
   })
+  const aiRes = await fetch(chatUrl, { method: 'POST', headers: chatHeaders, body: JSON.stringify(chatBody) })
   const aiData = await aiRes.json()
-  if (!aiData.choices?.[0]) throw Object.assign(new Error(aiData.error?.message || 'AI 返回异常'), { status: 500 })
-  const raw = (aiData.choices[0].message.content || '').trim()
+  const parsed = parseChatCompletion(activeModel, aiData)
+  if (!parsed) throw Object.assign(new Error(aiData.error?.message || aiData.error?.type || 'AI 返回异常'), { status: 500 })
+  const raw = (parsed.text || '').trim()
   const skipped = raw === DIARY_SKIP_MARKER || raw.startsWith(DIARY_SKIP_MARKER)
   const diaryContent = skipped ? null : raw
 
@@ -1329,6 +1464,19 @@ async function generateDiaryForDate(dateStr) {
     .upsert([{ date: dateStr, content: diaryContent, skipped, created_at: new Date().toISOString() }], { onConflict: 'date' })
     .select()
   if (error) throw Object.assign(new Error(error.message), { status: 500 })
+
+  // 2026-08-11 修复：写日记这件事本身，之前从没进过 Ombre Brain 的记忆池
+  // ——日记存在独立的 diary 表里，跟聊天时 breath 检索的记忆池完全是两套
+  // 数据，写完日记后聊天里问"记不记得刚刚写日记的事"，模型是真的从来没
+  // 被告知过这件事，不是揣着记忆却选择说不记得。这里在真写出正文（没
+  // 跳过）时补一条 hold，让"写过这天的日记"本身也变成一条可检索的记忆；
+  // 非阻塞，hold 失败不影响日记接口本身返回
+  if (!skipped && diaryContent) {
+    callOmbreTool('hold', { content: `我在${dateStr}这天写了一篇日记，记的是：${diaryContent.slice(0, 60)}` })
+      .then(() => console.log('🧠 日记已存入记忆:', dateStr))
+      .catch(e => console.error('日记 hold 失败:', e.message))
+  }
+
   return data[0]
 }
 
@@ -2030,31 +2178,26 @@ async function runInkStream({ req, res, send, noteId, mode }) {
 [DECISION: new] —— 这个方向已经写透了，你觉得可以让对方根据你写的这段，另开一个新方向或新场景写下去。
 拿不准就选 finalize。这一行只给程序解析用，不会显示给任何人看，所以不算破坏上面"一次交出完整成品"这条规则。`
 
-  const sendMessages = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user',   content: buildInkUserPrompt(mode, note) },
-  ]
+  const inkMessages = [{ role: 'user', content: buildInkUserPrompt(mode, note) }]
 
   const upstreamController = new AbortController()
   let clientAborted = false
   const onClose = () => { clientAborted = true; upstreamController.abort(); if (!res.writableEnded) { try { res.destroy() } catch {} } }
   req.on('close', onClose)
 
-  let fullText = '', usage = null, finishReason = null
+  let fullText = '', finishReason = null
+  let usageRef = { current: null }
   let sentLen = 0 // 已经转发给前端的字符数——尾部固定留 DECISION_TAIL_HOLD 个字不发
 
   try {
-    const aiRes = await fetch(activeModel.baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
-      body: JSON.stringify({
-        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
-        max_tokens: INK_MAX_TOKENS,
-        stream: true, stream_options: { include_usage: true },
-        // 这里没有转发 reasoning_content 给前端，开思考模式只会白白多花
-        // 思考 token、还会让上面的 temperature 失效，所以显式关掉
-        ...deepseekThinking(activeModel.requestModel, false),
-      }),
+    const { url: inkUrl, headers: inkHeaders, body: inkBody } = buildChatRequest(activeModel, {
+      system: systemPrompt, messages: inkMessages, temperature, stream: true, maxTokens: INK_MAX_TOKENS,
+      // 这里没有转发 reasoning_content 给前端，开思考模式只会白白多花
+      // 思考 token、还会让上面的 temperature 失效，所以显式关掉
+      thinkingEnabled: false,
+    })
+    const aiRes = await fetch(inkUrl, {
+      method: 'POST', headers: inkHeaders, body: JSON.stringify(inkBody),
       signal: upstreamController.signal,
     })
 
@@ -2077,14 +2220,13 @@ async function runInkStream({ req, res, send, noteId, mode }) {
         if (t.startsWith('data: ')) {
           try {
             const ev = JSON.parse(t.slice(6))
-            const delta = ev.choices?.[0]?.delta
-            if (delta?.content) {
-              fullText += delta.content
+            const { token, truncated } = parseStreamEvent(activeModel.protocol, ev, usageRef)
+            if (truncated) finishReason = 'length' // 归一化成下面 wasCut 判断认的哨兵值
+            if (token) {
+              fullText += token
               const safeLen = Math.max(0, fullText.length - DECISION_TAIL_HOLD)
               if (safeLen > sentLen) { send({ token: fullText.slice(sentLen, safeLen) }); sentLen = safeLen }
             }
-            if (ev.choices?.[0]?.finish_reason) finishReason = ev.choices[0].finish_reason
-            if (ev.usage) usage = ev.usage
           } catch {}
         }
       }
@@ -2099,6 +2241,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   if (!cleanText) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
 
   const wasCut = finishReason === 'length'   // 撞到 max_tokens 才算截断
+  const usage = usageRef.current
   const now = new Date().toISOString()
   const { data: saved } = await supabase.from('entries').insert([{
     note_id: noteId, author: 'shu', mode, content: cleanText, created_at: now,
