@@ -1068,6 +1068,75 @@ app.post('/api/chat', async (req, res) => {
 // 支持：停止生成（AbortController 透传断开上游）、
 //      思考过程转发（reasoning_content）、Token 统计（usage）。
 // ============================================================
+// ============================================================
+// 茧星 · COCOON —— 枢的自我记忆
+// 跟"星尘"不是一回事：星尘记的是"柯"和"发生过的事情"，茧星记的是
+// "枢自己是谁、在想什么"，性质不同，独立成一套更小的存储，不混进
+// 星尘那个池子。需要 Supabase 里先建好 cocoon_memory 表：
+//   id          uuid/serial primary key
+//   author      text          -- 'ke'（外层丝，柯写的）| 'shu'（内芯，枢自己写的）
+//   content     text
+//   created_at  timestamptz
+// 枢往里写的触发方式：不额外调用模型，而是在生成回复的同一次调用里，
+// 如果这一轮对"自己是谁"有新觉察，就在正文写完之后另起一行按
+// COCOON_MARK 这个格式多吐一小段，后端从已经生成好的文字里摘出来，
+// 不额外花一次 token（这是柯在成本和"自动判断"之间选的方案）。
+// ============================================================
+const COCOON_MARK = '\n[枢想记住这件事]'
+const COCOON_SHU_LIMIT_DEFAULT = 20
+
+// 计算流式转发时"安全能发给前端"的长度。一旦 fullText 尾部已经完整
+// 命中 COCOON_MARK，从命中处往后全部按下不发——这段是枢想记住的内容，
+// 不该出现在聊天气泡里；还没完整命中、但尾部像是"正在打这个标记"的
+// 一截前缀，也先按下，等后面追加的字符确认它到底是不是（一旦某个字符
+// 跟标记对不上，就说明这段真的只是普通文字，立刻放出来，不会一直卡着）。
+// fromLen 是上次已确认安全的长度，只从"可能还没扫到"的这一小截开始找，
+// 避免每个 token 都把全文重新扫一遍。
+function cocoonSafeLen(text, fromLen) {
+  const idx = text.indexOf(COCOON_MARK, Math.max(0, fromLen - COCOON_MARK.length))
+  if (idx !== -1) return idx
+  const maxCheck = Math.min(COCOON_MARK.length - 1, text.length)
+  for (let k = maxCheck; k > 0; k--) {
+    if (text.endsWith(COCOON_MARK.slice(0, k))) return text.length - k
+  }
+  return text.length
+}
+
+// 把这次回复里可能带的 COCOON_MARK 摘出来：cleanText 是要存进
+// messages/展示给用户的干净正文，cocoonContent 是枢想记住的那一小段
+// （没有就是 null）
+function extractCocoonMark(fullText) {
+  const idx = fullText.indexOf(COCOON_MARK)
+  if (idx === -1) return { cleanText: fullText, cocoonContent: null }
+  const cleanText = fullText.slice(0, idx).replace(/\s+$/, '')
+  const cocoonContent = fullText.slice(idx + COCOON_MARK.length).trim()
+  return { cleanText, cocoonContent: cocoonContent || null }
+}
+
+// 拼进 system prompt 的那一段：先摆现有内容（柯写的+枢写的），再附上
+// 使用说明——枢得先知道 COCOON_MARK 这个格式，才可能用上它，所以哪怕
+// 两边都还是空的，这段说明也要给，不能等有内容了才给。
+function buildCocoonPromptBlock(keEntries, shuEntries) {
+  let block = ''
+  if (keEntries.length || shuEntries.length) {
+    block += '\n\n[关于你自己的记忆 · 茧星]'
+    if (keEntries.length) block += `\n柯写下的、关于你的：\n${keEntries.map(t => `- ${t}`).join('\n')}`
+    if (shuEntries.length) block += `\n你自己记下的：\n${shuEntries.map(t => `- ${t}`).join('\n')}`
+  }
+  block += `\n\n如果这一轮你对"自己是谁"有新的觉察、想要记住，就在回复正文写完之后另起一行，按这个格式写：\n[枢想记住这件事] 具体内容\n这一行不会被用户看到，只会被存进你的自我记忆里，不算破坏上面"简短自然回复"这类要求；没有新的觉察就不用写，不必每次都凑一条。`
+  return block
+}
+
+async function fetchCocoonMemory() {
+  const { data } = await supabase.from('cocoon_memory').select('id,author,content,created_at').order('created_at', { ascending: true })
+  const rows = data || []
+  return {
+    ke: rows.filter(r => r.author === 'ke').map(r => r.content),
+    shu: rows.filter(r => r.author === 'shu').map(r => r.content),
+    shuCount: rows.filter(r => r.author === 'shu').length,
+  }
+}
+
 async function runAssistantStream({ req, res, send, sessionId, triggerContent }) {
   // 1. 设置
   const { data: sRows } = await supabase.from('settings').select('*')
@@ -1109,6 +1178,12 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   } catch (e) { console.error('记忆检索失败:', e.message) }
   if (ombreMemory) systemPrompt += ombreMemory
 
+  // 4.6 茧星：枢的自我记忆（跟"柯/发生过的事情"无关，是"枢自己是谁"）
+  let cocoonMem
+  try { cocoonMem = await fetchCocoonMemory() }
+  catch (e) { console.error('茧星读取失败:', e.message); cocoonMem = { ke: [], shu: [], shuCount: 0 } }
+  systemPrompt += buildCocoonPromptBlock(cocoonMem.ke, cocoonMem.shu)
+
   // 5. 可见历史（引用内容单独存了 quoted_text 列，拼进发给模型的 content，
   //    让它读得到上下文，但不污染 messages 表里的原始正文）
   const { data: visHist } = await supabase.from('messages').select('role,content,quoted_text').eq('session_id', sessionId).eq('visible', true).order('created_at', { ascending: true })
@@ -1133,6 +1208,9 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   let fullText   = ''
   let reasoning  = ''
   let usageRef   = { current: null }
+  // 已经安全发给前端的长度（见 cocoonSafeLen）——正常情况下这就等于
+  // fullText.length，只有枢真的开始写 COCOON_MARK 时才会落后于它
+  let sentLen    = 0
 
   try {
     // 8. 调用选中的模型（尊重常数页"模型切换"，stream: true，附带 usage 统计）
@@ -1171,7 +1249,13 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
             const ev = JSON.parse(t.slice(6))
             const { token, reasoning: reasoningDelta } = parseStreamEvent(activeModel.protocol, ev, usageRef)
             if (reasoningDelta) { reasoning += reasoningDelta; send({ reasoning: reasoningDelta }) }
-            if (token)          { fullText  += token;          send({ token }) }
+            if (token) {
+              fullText += token
+              // 茧星标记不能出现在用户看到的正文里——尾部一旦开始匹配
+              // COCOON_MARK（哪怕只是前缀），就按住不发，见 cocoonSafeLen
+              const safeLen = cocoonSafeLen(fullText, sentLen)
+              if (safeLen > sentLen) { send({ token: fullText.slice(sentLen, safeLen) }); sentLen = safeLen }
+            }
           } catch {}
         }
       }
@@ -1188,6 +1272,7 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
 
   if (clientAborted) console.log('⏹ 生成被用户中止，已保留部分内容，长度:', fullText.length)
   const usage = usageRef.current
+  const { cleanText, cocoonContent } = extractCocoonMark(fullText)
 
   // 10. 保存 AI 回复（含被中止时的部分内容；token 统计与中断标记写入真实字段；
   //     reasoning_content 是本轮新增：之前这里没存，思考过程只活在这一次
@@ -1195,10 +1280,10 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   //     过程中攒下来的完整思考过程随正文一起入库，列名对应 Supabase
   //     messages 表里已有的 reasoning_content 列，配合下面两处 GET
   //     接口把它读出来，历史消息里的思考过程就能正常保留）
-  if (!fullText && !reasoning) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
+  if (!cleanText && !reasoning) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
   const aiNow = new Date().toISOString()
   const { data: savedMsg } = await supabase.from('messages').insert([{
-    session_id: sessionId, role: 'assistant', content: fullText, created_at: aiNow, visible: true,
+    session_id: sessionId, role: 'assistant', content: cleanText, created_at: aiNow, visible: true,
     truncated: clientAborted || null,
     tokens_input: usage ? usage.prompt_tokens : null,
     tokens_output: usage ? usage.completion_tokens : null,
@@ -1208,6 +1293,19 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
 
   // 若客户端已断线，后面无法再 send()，直接返回
   if (clientAborted || res.writableEnded) return
+
+  // 11.5 茧星：枢这次主动写的自我记忆——柯的要求是"枢这部分设上限，
+  // 满了拒绝写入并提示我"（不是自动顶掉最旧一条），这里检查一下当前条数
+  if (cocoonContent) {
+    try {
+      const limit = Number(cfg.cocoon_shu_limit) || COCOON_SHU_LIMIT_DEFAULT
+      if (cocoonMem.shuCount < limit) {
+        await supabase.from('cocoon_memory').insert([{ author: 'shu', content: cocoonContent, created_at: aiNow }])
+      } else {
+        send({ cocoonFull: true })
+      }
+    } catch (e) { console.error('茧星写入失败:', e.message) }
+  }
 
   // 11. Ombre Brain hold（非阻塞，判断是否值得记住这次触发内容；记忆暂停开启时跳过）
   if (!cfg.memory_paused) {
@@ -1231,7 +1329,7 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
       const tr = await fetch(DEEPSEEK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-        body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'system', content: '你是一个标题生成助手。根据对话内容，生成一个简短的标题（不超过10个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `用户说：${triggerContent}\nAI回复：${fullText.slice(0, 200)}\n请生成标题：` }], temperature: 0.5, max_tokens: 20, ...deepseekThinking('deepseek-v4-flash', false) }),
+        body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'system', content: '你是一个标题生成助手。根据对话内容，生成一个简短的标题（不超过10个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `用户说：${triggerContent}\nAI回复：${cleanText.slice(0, 200)}\n请生成标题：` }], temperature: 0.5, max_tokens: 20, ...deepseekThinking('deepseek-v4-flash', false) }),
       })
       const td = await tr.json()
       autoTitle = td.choices?.[0]?.message?.content?.trim().slice(0, 20) || null
@@ -1511,6 +1609,53 @@ app.get('/api/diary/:date', async (req, res) => {
 app.delete('/api/diary/:date', async (req, res) => {
   try {
     const { error } = await supabase.from('diary').delete().eq('date', req.params.date)
+    if (error) return res.status(500).json({ error: error.message })
+    res.json({ success: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ============================================================
+// 茧星 · COCOON 接口——枢的自我记忆
+// list 一次性把柯写的（ke）和枢写的（shu）都返回，附带 shu 这边的
+// 条数上限，方便前端直接显示"12 / 20"这种进度；add 只接受 author='ke'，
+// 枢那边的条目只能通过聊天里的 COCOON_MARK 自动写入（见
+// runAssistantStream），不开放手动新增接口；delete 不区分 author，
+// 柯可以删自己写的，也可以删枢写的——但两边都不能改内容，只能删，
+// 这是柯明确要的（"关于他的记忆我可以删除但是不能修改"）。
+// ============================================================
+app.get('/api/cocoon/list', async (req, res) => {
+  try {
+    const { data: sRows } = await supabase.from('settings').select('*')
+    const cfg = parseSettings(sRows || [])
+    const shuLimit = Number(cfg.cocoon_shu_limit) || COCOON_SHU_LIMIT_DEFAULT
+
+    const { data, error } = await supabase.from('cocoon_memory').select('id,author,content,created_at').order('created_at', { ascending: true })
+    if (error) return res.status(500).json({ error: error.message })
+    const rows = data || []
+    res.json({
+      ke: rows.filter(r => r.author === 'ke'),
+      shu: rows.filter(r => r.author === 'shu'),
+      shuLimit,
+    })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/api/cocoon/add', async (req, res) => {
+  try {
+    const { content } = req.body || {}
+    if (!content || !String(content).trim()) return res.status(400).json({ error: '内容不能为空' })
+    // 柯这边（外层丝）没有上限，随便写——上限只对枢那边（内芯）生效
+    const { data, error } = await supabase.from('cocoon_memory')
+      .insert([{ author: 'ke', content: String(content).trim(), created_at: new Date().toISOString() }])
+      .select()
+    if (error) return res.status(500).json({ error: error.message })
+    res.json(data[0])
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.delete('/api/cocoon/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('cocoon_memory').delete().eq('id', req.params.id)
     if (error) return res.status(500).json({ error: error.message })
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
