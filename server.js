@@ -199,9 +199,10 @@ async function shouldRemember(content, sensitivity = 'medium') {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'deepseek-chat',
+        model: 'deepseek-v4-flash',
         messages: [{ role: 'user', content: buildPrompt(content) }],
         max_tokens: 2, temperature: 0,
+        ...deepseekThinking('deepseek-v4-flash', false),
       }),
     })
     const d = await r.json()
@@ -216,9 +217,10 @@ async function extractFact(content) {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'deepseek-chat',
+        model: 'deepseek-v4-flash',
         messages: [{ role: 'user', content: `把用户这句话里的事实提炼成一句最简短的陈述句（不超过20字），第三人称"用户"开头。只输出提炼后的句子，不要解释，不要标点以外的多余内容。\n\n用户说：${content}` }],
         max_tokens: 40, temperature: 0,
+        ...deepseekThinking('deepseek-v4-flash', false),
       }),
     })
     const d = await r.json()
@@ -288,17 +290,28 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 
 // ============================================================
 // 多模型解析 —— 常数页"模型切换"（C级）
-// cfg.models：设置里存的自定义模型列表（JSON 字符串），每项结构：
-//   { id, label, baseUrl, requestModel, apiKeyEnvVar, apiKey }
-// 内置 DeepSeek 永远可用、不占用户填 key（走 DEEPSEEK_API_KEY 环境变量）；
-// 用户新增的模型如果在设置里直接填了 apiKey 就优先用它，
-// 否则退回 apiKeyEnvVar 指定名字的环境变量。
+// cfg.models：设置里存的模型列表（JSON 字符串或数组），每项结构：
+//   { id, label, baseUrl, requestModel, apiKeyEnvVar, apiKey, providerId }
+// providerId 标记这条模型是从哪个"提供商"（见 EchoPage 的 PROVIDERS 卡片）
+// 派生出来的，提供商改密钥时能批量同步到它名下所有模型条目；
+// providerId === 'deepseek' 且自己没填 apiKey 时，回退到 DEEPSEEK_API_KEY
+// 环境变量，保留"内置 DeepSeek 不强制填 key"的便利，但密钥仍可在
+// 设置页随时覆盖，不用改环境变量重新部署。
+//
+// 2026-08-11 修复：DeepSeek 官方已于 2026-07-24 15:59 UTC 下线
+// deepseek-chat / deepseek-reasoner 这两个模型名（调用直接报错），
+// 统一改用 deepseek-v4-flash / deepseek-v4-pro。下面兜底值同步改掉；
+// BUILTIN_MODEL_ID 现在只是一个内部占位 id（找不到 cfg.model 对应项时
+// 落到这条兜底），不再等同于要发给 API 的真实模型名——包括旧数据里
+// 残留的 'deepseek-chat' 这个值，也会因为在 cfg.models 里找不到匹配项
+// 而自然落进这条兜底分支，不需要额外做数据迁移。
+//
 // 注意：这里假设所有接入的模型都兼容 OpenAI 风格的
 // /chat/completions 请求体与流式返回格式（DeepSeek、Moonshot、Qwen、
 // GLM 等国内主流模型大多如此）。如果以后要接原生 Claude / Gemini 这类
 // 请求体形状完全不同的接口，需要单独加一层适配，不能直接复用这个函数。
 // ============================================================
-const BUILTIN_MODEL_ID = 'deepseek-chat'
+const BUILTIN_MODEL_ID = 'deepseek-builtin-default'
 
 function parseModelList(cfg) {
   const raw = cfg.models
@@ -310,15 +323,16 @@ function parseModelList(cfg) {
 }
 
 function resolveModel(cfg, modelId) {
-  if (!modelId || modelId === BUILTIN_MODEL_ID) {
-    return { id: BUILTIN_MODEL_ID, label: 'DeepSeek', baseUrl: DEEPSEEK_URL, requestModel: 'deepseek-chat', apiKey: process.env.DEEPSEEK_API_KEY }
-  }
   const found = parseModelList(cfg).find(m => m.id === modelId)
   if (!found) {
-    // 找不到配置（比如被删掉了）就兜底回 DeepSeek，不让聊天直接失败
-    return { id: BUILTIN_MODEL_ID, label: 'DeepSeek', baseUrl: DEEPSEEK_URL, requestModel: 'deepseek-chat', apiKey: process.env.DEEPSEEK_API_KEY }
+    // 找不到配置（全新安装、cfg.model 为空、被删掉、或是旧版本残留的
+    // 已失效模型名）就兜底到一个确定能跑的默认值，不让聊天直接失败
+    return { id: BUILTIN_MODEL_ID, label: 'DeepSeek · V4 Flash', baseUrl: DEEPSEEK_URL, requestModel: 'deepseek-v4-flash', apiKey: process.env.DEEPSEEK_API_KEY }
   }
-  const apiKey = found.apiKey || (found.apiKeyEnvVar ? process.env[found.apiKeyEnvVar] : '') || ''
+  const apiKey = found.apiKey
+    || (found.providerId === 'deepseek' ? process.env.DEEPSEEK_API_KEY : '')
+    || (found.apiKeyEnvVar ? process.env[found.apiKeyEnvVar] : '')
+    || ''
   return {
     id: found.id,
     label: found.label || found.id,
@@ -326,6 +340,24 @@ function resolveModel(cfg, modelId) {
     requestModel: found.requestModel || found.id,
     apiKey,
   }
+}
+
+// ============================================================
+// DeepSeek V4 思考模式（Thinking Mode）参数
+// 官方文档：https://api-docs.deepseek.com/guides/thinking_mode
+// deepseek-v4-flash / deepseek-v4-pro 默认就开思考模式，这里选择显式
+// 传参而不是依赖默认值，一是不想哪天官方默认行为一变、思考过程就
+// 悄悄消失；二是思考模式下 temperature/top_p/presence_penalty/
+// frequency_penalty 这几个参数官方文档写明"不报错，但不生效"，所以
+// 像标题生成、结构化提取这类明确不需要思考、且依赖 temperature 生效
+// 的辅助调用，要显式关掉思考模式，两边才都对。
+// 只对 requestModel 匹配 deepseek-v4* 的情况生效；其它兼容供应商未必
+// 认识 thinking 这个字段，贸然传可能被严格实现直接拒绝，所以这里不
+// 对非 DeepSeek V4 的模型做任何事（返回空对象，等于没传）。
+// ============================================================
+function deepseekThinking(requestModel, enabled) {
+  if (!/^deepseek-v4/i.test(String(requestModel || ''))) return {}
+  return { thinking: { type: enabled ? 'enabled' : 'disabled' } }
 }
 
 // ── 工具函数 ──────────────────────────────────────────────────
@@ -480,6 +512,47 @@ app.post('/api/settings', async (req, res) => {
     }
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ============================================================
+// 模型发现接口 —— EchoPage「提供商」卡片用：填好 baseUrl/apiKey 后
+// 点"获取模型列表"，由后端代为请求该服务商的 /models 列表接口
+// （标准 OpenAI 兼容格式：GET {origin}/models，Bearer 鉴权，返回
+// { data: [{ id, object, owned_by }, ...] }。DeepSeek 官方文档：
+// https://api-docs.deepseek.com/api/list-models/），前端拿到 id 列表
+// 后做勾选，勾中的才会真正写进 cfg.models。放在后端代理而不是前端
+// 直接请求：一是避免浏览器端跨域，二是密钥不用经浏览器直连第三方。
+// ============================================================
+app.post('/api/models/discover', async (req, res) => {
+  try {
+    const { baseUrl, apiKey, providerId } = req.body || {}
+    if (!baseUrl) return res.status(400).json({ error: '缺少接口地址' })
+
+    // baseUrl 存的是 chat/completions 端点（如 .../v1/chat/completions
+    // 或 .../chat/completions），模型列表跟它同源、把这一段换成 /models
+    let modelsUrl
+    try {
+      modelsUrl = baseUrl.replace(/\/chat\/completions\/?$/i, '').replace(/\/+$/, '') + '/models'
+    } catch { return res.status(400).json({ error: '接口地址格式不对' }) }
+
+    // 没填 key 时，DeepSeek 这个提供商允许退回环境变量（跟实际聊天调用
+    // 的兜底逻辑一致）；其它自定义提供商没填 key 就是真没有，不瞎猜
+    let isDeepSeek = providerId === 'deepseek'
+    try { isDeepSeek = isDeepSeek || /(^|\.)api\.deepseek\.com$/i.test(new URL(modelsUrl).hostname) } catch {}
+    const key = apiKey || (isDeepSeek ? process.env.DEEPSEEK_API_KEY : '') || ''
+    if (!key) return res.status(400).json({ error: '没有可用的 API Key' })
+
+    const r = await fetch(modelsUrl, { headers: { 'Authorization': `Bearer ${key}` } })
+    if (!r.ok) {
+      const t = await r.text()
+      return res.status(502).json({ error: `获取模型列表失败（HTTP ${r.status}）：${t.slice(0, 200)}` })
+    }
+    const data = await r.json()
+    const models = (data.data || []).map(m => ({ id: m.id, ownedBy: m.owned_by || '' }))
+    res.json({ models })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
 })
 
 // ============================================================
@@ -693,12 +766,13 @@ async function compressHistory(sessionId, oldMsgList, compressPrompt) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
     body: JSON.stringify({
-      model: 'deepseek-chat',
+      model: 'deepseek-v4-flash',
       messages: [
         { role: 'system', content: compressPrompt },
         { role: 'user',   content: `把下面对话总结成长期记忆，保留重要信息：\n${contentText}` },
       ],
       temperature: 0.3,
+      ...deepseekThinking('deepseek-v4-flash', false),
     }),
   })
   const d = await aiRes.json()
@@ -778,7 +852,10 @@ app.post('/api/chat', async (req, res) => {
     const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
-      body: JSON.stringify({ model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature) }),
+      body: JSON.stringify({
+        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
+        ...deepseekThinking(activeModel.requestModel, true),
+      }),
     })
     const aiData = await aiRes.json()
     if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
@@ -814,7 +891,7 @@ app.post('/api/chat', async (req, res) => {
         const tr = await fetch(DEEPSEEK_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-          body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'system', content: '你是一个标题生成助手。根据对话内容，生成一个简短的标题（不超过10个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `用户说：${content}\nAI回复：${replyText}\n请生成标题：` }], temperature: 0.5, max_tokens: 20 }),
+          body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'system', content: '你是一个标题生成助手。根据对话内容，生成一个简短的标题（不超过10个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `用户说：${content}\nAI回复：${replyText}\n请生成标题：` }], temperature: 0.5, max_tokens: 20, ...deepseekThinking('deepseek-v4-flash', false) }),
         })
         const td = await tr.json()
         autoTitle = td.choices?.[0]?.message?.content?.trim().slice(0, 20) || null
@@ -902,12 +979,14 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
 
   try {
     // 8. 调用选中的模型（尊重常数页"模型切换"，stream: true，附带 usage 统计）
+    //    DeepSeek V4 显式传 thinking:enabled——见 deepseekThinking() 顶部注释
     const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
       body: JSON.stringify({
         model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
         stream: true, stream_options: { include_usage: true },
+        ...deepseekThinking(activeModel.requestModel, true),
       }),
       signal: upstreamController.signal,
     })
@@ -994,7 +1073,7 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
       const tr = await fetch(DEEPSEEK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-        body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'system', content: '你是一个标题生成助手。根据对话内容，生成一个简短的标题（不超过10个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `用户说：${triggerContent}\nAI回复：${fullText.slice(0, 200)}\n请生成标题：` }], temperature: 0.5, max_tokens: 20 }),
+        body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'system', content: '你是一个标题生成助手。根据对话内容，生成一个简短的标题（不超过10个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `用户说：${triggerContent}\nAI回复：${fullText.slice(0, 200)}\n请生成标题：` }], temperature: 0.5, max_tokens: 20, ...deepseekThinking('deepseek-v4-flash', false) }),
       })
       const td = await tr.json()
       autoTitle = td.choices?.[0]?.message?.content?.trim().slice(0, 20) || null
@@ -1118,7 +1197,10 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
-      body: JSON.stringify({ model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature) }),
+      body: JSON.stringify({
+        model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
+        ...deepseekThinking(activeModel.requestModel, true),
+      }),
     })
     const aiData = await aiRes.json()
     if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
@@ -1162,7 +1244,7 @@ async function generateDiaryForDate(dateStr) {
   const aiRes = await fetch(DEEPSEEK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: prompt }], temperature: 0.9 }),
+    body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: prompt }], temperature: 0.9, ...deepseekThinking('deepseek-v4-flash', false) }),
   })
   const aiData = await aiRes.json()
   if (!aiData.choices?.[0]) throw Object.assign(new Error(aiData.error?.message || 'AI 返回异常'), { status: 500 })
@@ -1325,7 +1407,7 @@ async function extractReminders(memoText) {
     const aiRes = await fetch(DEEPSEEK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: prompt }], temperature: 0 }),
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: prompt }], temperature: 0, ...deepseekThinking('deepseek-v4-flash', false) }),
     })
     const aiData = await aiRes.json()
     const raw = aiData.choices?.[0]?.message?.content || '[]'
@@ -1883,6 +1965,9 @@ async function runInkStream({ req, res, send, noteId, mode }) {
         model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
         max_tokens: INK_MAX_TOKENS,
         stream: true, stream_options: { include_usage: true },
+        // 这里没有转发 reasoning_content 给前端，开思考模式只会白白多花
+        // 思考 token、还会让上面的 temperature 失效，所以显式关掉
+        ...deepseekThinking(activeModel.requestModel, false),
       }),
       signal: upstreamController.signal,
     })
@@ -1952,9 +2037,10 @@ async function runInkStream({ req, res, send, noteId, mode }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
         body: JSON.stringify({
-          model: 'deepseek-chat',
+          model: 'deepseek-v4-flash',
           messages: [{ role: 'system', content: '你是一个标题生成助手。根据这篇笔记正文，生成一个简短的标题（不超过12个字），直接返回标题文字，不要加引号或其他符号。' }, { role: 'user', content: `正文：${cleanText.slice(0, 400)}\n请生成标题：` }],
           temperature: 0.5, max_tokens: 20,
+          ...deepseekThinking('deepseek-v4-flash', false),
         }),
       })
       const td = await tr.json()
