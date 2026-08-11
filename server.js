@@ -420,7 +420,7 @@ app.delete('/api/session/:id', async (req, res) => {
 app.get('/api/messages/:sessionId', async (req, res) => {
   try {
     const { data, error } = await supabase.from('messages')
-      .select('role,content,id,created_at,visible,quoted_text,is_edited,truncated,tokens_input,tokens_output')
+      .select('role,content,id,created_at,visible,quoted_text,is_edited,truncated,tokens_input,tokens_output,reasoning_content')
       .eq('session_id', req.params.sessionId)
       .eq('visible', true)
       .order('created_at', { ascending: true })
@@ -436,7 +436,7 @@ app.get('/api/messages/archived/:sessionId', async (req, res) => {
     const cursor = req.query.cursor
 
     let query = supabase.from('messages')
-      .select('role,content,id,created_at,visible,quoted_text,is_edited,truncated,tokens_input,tokens_output')
+      .select('role,content,id,created_at,visible,quoted_text,is_edited,truncated,tokens_input,tokens_output,reasoning_content')
       .eq('session_id', sessionId)
       .eq('visible', false)
       .order('created_at', { ascending: true })
@@ -783,10 +783,13 @@ app.post('/api/chat', async (req, res) => {
     const aiData = await aiRes.json()
     if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
     const replyText = aiData.choices[0].message.content
+    // 非流式响应里，支持推理的模型通常把思考过程放在 message.reasoning_content
+    // （跟流式的 delta.reasoning_content 是同一份数据，只是不分片），一并存下来
+    const replyReasoning = aiData.choices[0].message.reasoning_content || null
 
     // 9. 保存 AI 回复（附带这次实际用的模型，供 Token 统计按模型拆分）
     const aiNow = new Date().toISOString()
-    const { data: savedMsg, error: aErr } = await supabase.from('messages').insert([{ session_id: sessionId, role: 'assistant', content: replyText, created_at: aiNow, visible: true, model: activeModel.id }]).select()
+    const { data: savedMsg, error: aErr } = await supabase.from('messages').insert([{ session_id: sessionId, role: 'assistant', content: replyText, created_at: aiNow, visible: true, model: activeModel.id, reasoning_content: replyReasoning }]).select()
     if (aErr) return res.status(500).json({ error: 'AI回复保存失败: ' + aErr.message })
 
     // 9.5 Ombre Brain hold（非阻塞；记忆暂停开启时跳过所有自动 hold）
@@ -949,7 +952,12 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
 
   if (clientAborted) console.log('⏹ 生成被用户中止，已保留部分内容，长度:', fullText.length)
 
-  // 10. 保存 AI 回复（含被中止时的部分内容；token 统计与中断标记写入真实字段）
+  // 10. 保存 AI 回复（含被中止时的部分内容；token 统计与中断标记写入真实字段；
+  //     reasoning_content 是本轮新增：之前这里没存，思考过程只活在这一次
+  //     请求的内存里，刷新页面或切换会话再切回来就彻底没了——现在流式
+  //     过程中攒下来的完整思考过程随正文一起入库，列名对应 Supabase
+  //     messages 表里已有的 reasoning_content 列，配合下面两处 GET
+  //     接口把它读出来，历史消息里的思考过程就能正常保留）
   if (!fullText && !reasoning) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
   const aiNow = new Date().toISOString()
   const { data: savedMsg } = await supabase.from('messages').insert([{
@@ -958,6 +966,7 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
     tokens_input: usage ? usage.prompt_tokens : null,
     tokens_output: usage ? usage.completion_tokens : null,
     model: activeModel.id,
+    reasoning_content: reasoning || null,
   }]).select()
 
   // 若客户端已断线，后面无法再 send()，直接返回
@@ -1114,9 +1123,13 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const aiData = await aiRes.json()
     if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
     const replyText = aiData.choices[0].message.content
+    const replyReasoning = aiData.choices[0].message.reasoning_content || null
 
     const now = new Date().toISOString()
-    await supabase.from('messages').update({ content: replyText, created_at: now, model: activeModel.id }).eq('id', lastMsg.id)
+    // 重新生成会覆盖这条消息原来的内容——旧的 reasoning 是对应旧回复的思考过程，
+    // 新回复如果模型没返回思考过程（或换了不支持推理的模型），要一并清空，
+    // 不然会出现"内容是新的、思考过程却是旧的"这种对不上的情况
+    await supabase.from('messages').update({ content: replyText, created_at: now, model: activeModel.id, reasoning_content: replyReasoning }).eq('id', lastMsg.id)
     await supabase.from('sessions').update({ updated_at: now }).eq('id', sessionId)
 
     res.json({ reply: replyText })
