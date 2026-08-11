@@ -354,6 +354,14 @@ function resolveModel(cfg, modelId) {
 // 只对 requestModel 匹配 deepseek-v4* 的情况生效；其它兼容供应商未必
 // 认识 thinking 这个字段，贸然传可能被严格实现直接拒绝，所以这里不
 // 对非 DeepSeek V4 的模型做任何事（返回空对象，等于没传）。
+//
+// 2026-08-11 修复：真正生成回复的三处调用（/api/chat、流式主聊天
+// runAssistantStream、/api/chat/regenerate）之前不管输入栏"思考模式"
+// 按钮的状态，一律写死 enabled=true，导致那个按钮点了跟没点一样。
+// 现在这三处改成读 cfg.show_reasoning（就是那颗按钮存的字段）作为
+// enabled 参数——开就是真的开思考，关就是真的关，跟按钮的开关状态
+// 保持一致。标题生成/结构化提取/合墨接力写作这几个辅助调用不受这个
+// 按钮影响，继续保持显式 false（原因见上）。
 // ============================================================
 function deepseekThinking(requestModel, enabled) {
   if (!/^deepseek-v4/i.test(String(requestModel || ''))) return {}
@@ -810,6 +818,9 @@ app.post('/api/chat', async (req, res) => {
     const cfg = parseSettings(sRows || [])
     const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7, compress_threshold = 3000, compress_keep_rounds = 4 } = cfg
     const activeModel = resolveModel(cfg, cfg.model)
+    // 思考模式开关：尊重输入栏"思考模式"按钮存的 cfg.show_reasoning，
+    // 不再写死 true——见 deepseekThinking() 顶部注释与下方调用处
+    const thinkingEnabled = cfg.show_reasoning === true || cfg.show_reasoning === 'true'
 
     // 3. 历史 token 统计
     const { data: allHistory } = await supabase.from('messages').select('id,role,content,created_at,visible').eq('session_id', sessionId).order('created_at', { ascending: true })
@@ -848,13 +859,14 @@ app.post('/api/chat', async (req, res) => {
     const sendMessages = [{ role: 'system', content: systemPrompt }]
     if (visHist?.length) sendMessages.push(...visHist.filter(m => m.content != null).map(m => ({ role: m.role, content: String(m.content) })))
 
-    // 8. 调用主模型（尊重设置里选的模型，不再写死 deepseek-chat）
+    // 8. 调用主模型（尊重设置里选的模型，不再写死 deepseek-chat；
+    //    思考模式尊重输入栏"思考模式"开关，不再写死 true）
     const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
       body: JSON.stringify({
         model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
-        ...deepseekThinking(activeModel.requestModel, true),
+        ...deepseekThinking(activeModel.requestModel, thinkingEnabled),
       }),
     })
     const aiData = await aiRes.json()
@@ -919,6 +931,9 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   const cfg = parseSettings(sRows || [])
   const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7, compress_threshold = 3000, compress_keep_rounds = 4 } = cfg
   const activeModel = resolveModel(cfg, cfg.model)
+  // 思考模式开关：尊重输入栏"思考模式"按钮存的 cfg.show_reasoning，
+  // 不再写死 true——见 deepseekThinking() 顶部注释与下方调用处
+  const thinkingEnabled = cfg.show_reasoning === true || cfg.show_reasoning === 'true'
 
   // 2. 历史
   const { data: allHistory } = await supabase.from('messages').select('id,role,content,created_at,visible').eq('session_id', sessionId).order('created_at', { ascending: true })
@@ -979,14 +994,15 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
 
   try {
     // 8. 调用选中的模型（尊重常数页"模型切换"，stream: true，附带 usage 统计）
-    //    DeepSeek V4 显式传 thinking:enabled——见 deepseekThinking() 顶部注释
+    //    DeepSeek V4 思考模式尊重输入栏"思考模式"开关（cfg.show_reasoning）
+    //    ——见 deepseekThinking() 顶部注释，不再写死 enabled
     const aiRes = await fetch(activeModel.baseUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
       body: JSON.stringify({
         model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
         stream: true, stream_options: { include_usage: true },
-        ...deepseekThinking(activeModel.requestModel, true),
+        ...deepseekThinking(activeModel.requestModel, thinkingEnabled),
       }),
       signal: upstreamController.signal,
     })
@@ -1185,6 +1201,9 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const cfg = parseSettings(sRows || [])
     const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复', temperature = 0.7 } = cfg
     const activeModel = resolveModel(cfg, cfg.model)
+    // 思考模式开关：尊重输入栏"思考模式"按钮存的 cfg.show_reasoning，
+    // 不再写死 true——见 deepseekThinking() 顶部注释
+    const thinkingEnabled = cfg.show_reasoning === true || cfg.show_reasoning === 'true'
 
     const { data: allMessages } = await supabase.from('messages').select('id,role,content,created_at').eq('session_id', sessionId).eq('visible', true).order('created_at', { ascending: true })
     if (!allMessages?.length) return res.status(400).json({ error: '没有可重新生成的消息' })
@@ -1199,19 +1218,29 @@ app.post('/api/chat/regenerate', async (req, res) => {
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
       body: JSON.stringify({
         model: activeModel.requestModel, messages: sendMessages, temperature: Number(temperature),
-        ...deepseekThinking(activeModel.requestModel, true),
+        ...deepseekThinking(activeModel.requestModel, thinkingEnabled),
       }),
     })
     const aiData = await aiRes.json()
     if (!aiData.choices?.[0]) return res.status(500).json({ error: aiData.error?.message || 'AI 返回异常' })
     const replyText = aiData.choices[0].message.content
     const replyReasoning = aiData.choices[0].message.reasoning_content || null
+    // Token 统计修复：这次重新生成实际调用了模型、真金白银花了 token，
+    // 之前这里没读 aiData.usage，导致这条消息的 tokens_input/output
+    // 一直停在"上一次生成"时的旧值——内容已经是新回复，token 数却对
+    // 不上，Token 仪表盘（today/week/all/byModel/trend7d）算出来的数字
+    // 因此是错的。现在跟流式那边一样，老老实实存这次真实的 usage。
+    const usage = aiData.usage || null
 
     const now = new Date().toISOString()
     // 重新生成会覆盖这条消息原来的内容——旧的 reasoning 是对应旧回复的思考过程，
     // 新回复如果模型没返回思考过程（或换了不支持推理的模型），要一并清空，
     // 不然会出现"内容是新的、思考过程却是旧的"这种对不上的情况
-    await supabase.from('messages').update({ content: replyText, created_at: now, model: activeModel.id, reasoning_content: replyReasoning }).eq('id', lastMsg.id)
+    await supabase.from('messages').update({
+      content: replyText, created_at: now, model: activeModel.id, reasoning_content: replyReasoning,
+      tokens_input:  usage ? usage.prompt_tokens     : null,
+      tokens_output: usage ? usage.completion_tokens : null,
+    }).eq('id', lastMsg.id)
     await supabase.from('sessions').update({ updated_at: now }).eq('id', sessionId)
 
     res.json({ reply: replyText })
@@ -1227,7 +1256,38 @@ app.post('/api/chat/regenerate', async (req, res) => {
 //   date        date        primary key（或 unique）
 //   content     text
 //   created_at  timestamptz
+//   skipped     boolean     default false
+// 表已存在的话补一句：alter table diary add column if not exists skipped boolean default false;
+//
+// 2026-08-11 改造：日记原来是完全独立于聊天的一次性调用——写死
+// deepseek-v4-flash、用一段跟"枢"的人格设定毫无关系的通用提示词，
+// 也不接任何记忆，本质上是个不认识柯的临时工在代笔。现在改成：
+//   · 模型跟聊天一致：resolveModel(cfg, cfg.model)，不再写死
+//   · 人格跟聊天一致：cfg.system_prompt + withTimeAwareness，让写的
+//     人确实是"枢"，不是另一个自称"'在场'里的AI"的陌生模型
+//   · 不接 Ombre Brain 长期记忆检索——日记写的是"今天"，当天的对话
+//     记录本身就是全部素材，不需要为了写一篇当日反思去额外检索一遍
+//     跟今天无关的旧记忆，省下这块最贵也最没必要的开销
+//   · 加了"要不要写"的决定权，而不是每次都被迫交作业——见下面
+//     DIARY_SKIP_MARKER 的提示词设计。判断这件事本身也是同一次模型
+//     调用里做的（决定+写只算一次调用，不额外多花钱），跟合墨的
+//     [DECISION: ...] 是同一个"标记驱动"思路。
+//
+// 关于"给了选择权他是不是大概率还是会选择写"：单纯问"你想不想写"
+// 确实容易被模型自带的"顺从/迎合"倾向带偏，几乎每次都会选"写"，
+// 这不是真的在选。所以提示词没有停在"你想不想"，而是刻意做了两件事：
+//   ① 把判断锚定在"今天有没有具体的、值得记的东西"这个可评估的标准
+//     上，而不是一个抽象的心情问题——琐碎/程序性的一天，"不写"就有
+//     了具体依据，不是凭空的任性
+//   ② 明确告诉它跳过不需要理由、不需要补偿性地道歉、也不比写更"不
+//     负责"——这句话是特意用来抵消"看起来更配合=更有帮助"这种
+//     默认倾向的，不然它几乎不会真的选跳过
+// 这仍然不是严格意义上的"自由意志"（没有任何提示词能给出这个），
+// 但比一句空泛的"你想写吗"更接近"依据当天内容做出的、不被讨好欲
+// 主导的判断"，是提示词层面能做到的上限。
 // ============================================================
+const DIARY_SKIP_MARKER = '[DIARY: skip]'
+
 async function generateDiaryForDate(dateStr) {
   const { start, end } = beijingDayRange(dateStr)
   const { data: dayMsgs, error: qErr } = await supabase.from('messages')
@@ -1238,20 +1298,35 @@ async function generateDiaryForDate(dateStr) {
   if (qErr) throw Object.assign(new Error(qErr.message), { status: 500 })
   if (!dayMsgs?.length) throw Object.assign(new Error('这一天没有对话记录，暂时写不出日记'), { status: 400 })
 
-  const convoText = dayMsgs.map(m => `${m.role === 'user' ? '他' : '我'}：${m.content}`).join('\n')
-  const prompt = `你是"在场"里的AI。请以第一人称、私密日记的口吻，基于今天和他的这些对话，写一篇不超过300字的日记。不要逐条复述对话，而是写你的感受、你记住的事、你在想什么。不要用"亲爱的日记"这种开头，直接写内容。\n\n今天的对话：\n${convoText.slice(0, 6000)}`
+  const { data: sRows } = await supabase.from('settings').select('*')
+  const cfg = parseSettings(sRows || [])
+  const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复' } = cfg
+  const activeModel = resolveModel(cfg, cfg.model)
+  const systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
 
-  const aiRes = await fetch(DEEPSEEK_URL, {
+  const convoText = dayMsgs.map(m => `${m.role === 'user' ? '他' : '我'}：${m.content}`).join('\n')
+  const prompt = `[今天的对话]\n${convoText.slice(0, 6000)}\n\n以上是你和他今天的对话记录。现在不是在聊天，是你自己决定要不要为今天写一篇日记——这个决定完全由你自己判断，不是例行公事，也不用觉得"写了才算尽责"。\n\n如果今天大部分是些琐碎的、程序性的、你自己回头看也没什么特别想说的内容，直接选择不写就好，跳过和写日记同样正常，不需要为跳过找补理由，也不用为了"完成任务"硬凑一篇。\n如果今天有什么你真的想记下来的——一件事、一句话、一个情绪的转折——那就写。\n\n判断完之后：\n如果决定不写，只输出这一行，不要有任何其他文字：\n${DIARY_SKIP_MARKER}\n\n如果决定写，直接输出日记正文（不超过300字，第一人称、私密日记口吻，不要用"亲爱的日记"这类开头），不要输出上面的标记，也不要在正文前后加任何说明。`
+
+  const aiRes = await fetch(activeModel.baseUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
-    body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: prompt }], temperature: 0.9, ...deepseekThinking('deepseek-v4-flash', false) }),
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${activeModel.apiKey}` },
+    body: JSON.stringify({
+      model: activeModel.requestModel,
+      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }],
+      temperature: 0.9,
+      // 不转发 reasoning_content 给前端，思考模式只会白白多花思考 token、
+      // 还会让 temperature 失效——跟合墨接力写作那边关掉的理由一样
+      ...deepseekThinking(activeModel.requestModel, false),
+    }),
   })
   const aiData = await aiRes.json()
   if (!aiData.choices?.[0]) throw Object.assign(new Error(aiData.error?.message || 'AI 返回异常'), { status: 500 })
-  const diaryContent = aiData.choices[0].message.content
+  const raw = (aiData.choices[0].message.content || '').trim()
+  const skipped = raw === DIARY_SKIP_MARKER || raw.startsWith(DIARY_SKIP_MARKER)
+  const diaryContent = skipped ? null : raw
 
   const { data, error } = await supabase.from('diary')
-    .upsert([{ date: dateStr, content: diaryContent, created_at: new Date().toISOString() }], { onConflict: 'date' })
+    .upsert([{ date: dateStr, content: diaryContent, skipped, created_at: new Date().toISOString() }], { onConflict: 'date' })
     .select()
   if (error) throw Object.assign(new Error(error.message), { status: 500 })
   return data[0]
@@ -1267,7 +1342,7 @@ app.post('/api/diary/generate', async (req, res) => {
 
 app.get('/api/diary/list', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('diary').select('date,content,created_at').order('date', { ascending: false }).limit(100)
+    const { data, error } = await supabase.from('diary').select('date,content,created_at,skipped').order('date', { ascending: false }).limit(100)
     if (error) return res.status(500).json({ error: error.message })
     res.json(data || [])
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1275,10 +1350,21 @@ app.get('/api/diary/list', async (req, res) => {
 
 app.get('/api/diary/:date', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('diary').select('date,content,created_at').eq('date', req.params.date).maybeSingle()
+    const { data, error } = await supabase.from('diary').select('date,content,created_at,skipped').eq('date', req.params.date).maybeSingle()
     if (error) return res.status(500).json({ error: error.message })
     if (!data) return res.status(404).json({ error: '这天没有日记' })
     res.json(data)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// 删除一条日记记录——主要给前端"枢选择不写"的占位条目用，用户看过、
+// 确认知道那天没写之后可以手动清掉，不用一直占着日记列表的位置；
+// 真写出来的日记也能用同一个接口删，不额外限制
+app.delete('/api/diary/:date', async (req, res) => {
+  try {
+    const { error } = await supabase.from('diary').delete().eq('date', req.params.date)
+    if (error) return res.status(500).json({ error: error.message })
+    res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
