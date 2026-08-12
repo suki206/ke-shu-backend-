@@ -2036,10 +2036,31 @@ app.get('/api/stats/tokens', async (req, res) => {
 // ============================================================
 
 const INK_MODES = ['original', 'continue', 'new']
+// 真人可以直接点明"这一段写完之后轮到谁、做什么"，盖掉模型自己的判断
+const INK_NEXT_TURNS = ['continue', 'new', 'finalize']
 
 // 不显式传的话就跟着上游默认值走，有的供应商只给几百 token，
 // 一段还没写完就被切断了——这是"续写只写一句"的次要成因之一
 const INK_MAX_TOKENS = Number(process.env.INK_MAX_TOKENS || 4000)
+
+// 【第十五批】记忆按模式给，不再三种模式一视同仁。
+// continue 接的是同一篇文章，前文可能真的在讲你们之间的事，记忆照旧
+// 全给。但 new / original 是"各写各的一篇作品"——把日记正文整块喂
+// 进去，模型会直接照着日记的腔调写（这就是"让他先写、写出来像日记"
+// 的直接原因）；Ombre 里那些真实往事也会一路把文章拽回"回忆＋抒情"。
+// 所以这两种模式默认不注入本地日记/时轨，Ombre 也不检索——他还是他
+// （人格设定和合墨那段规则都还在），只是这一篇不必写成回忆录。
+// 想改回去只动这张表就够。
+const INK_MEMORY_BY_MODE = {
+  continue: { ombre: true,  local: ['diary', 'chronos'] },
+  new:      { ombre: false, local: [] },
+  original: { ombre: false, local: [] },
+}
+
+// 写文章比聊天需要更大的发挥空间——聊天那档 temperature（默认 0.7）
+// 会让 new/original 一次次滑回同一套安全的抒情句式。只给非续写模式
+// 加，上限卡在 1（Anthropic 协议只认 0~1）。
+const INK_TEMPERATURE_BOOST = Number(process.env.INK_TEMPERATURE_BOOST || 0.2)
 
 // 追加正文时统一走这个：不是第一段的话，前面补一个自然的段落换行，
 // 让每一次落笔（不管是柯还是枢）都独立成一段，读起来齐整
@@ -2254,84 +2275,215 @@ app.put('/api/notes/:id/entries/:entryId', async (req, res) => {
 })
 
 // ── 生成上下文拼装 ─────────────────────────────────────────────
-// continue：把 note.content 整篇喂给模型，要求接着写下一段，语气/
-// 节奏衔接上一段；new：同样给整篇正文供参考，但明确要求另起一段
-// 新方向；original：正文还是空的，枢来起笔。三种模式统一要求正文
-// 独立成段，不需要输出任何标记或署名——下一步怎么办完全由真人在
-// 界面上点，不需要模型自己判断。
-function buildInkUserPrompt(mode, note) {
-  const title = note.title && note.title !== '未命名手记' ? note.title : '（还没有标题）'
-  const doc   = note.content || ''
+// 【第十五批·合墨定位修正】三种模式其实是三件完全不同的事，原来却
+// 共用同一份 baseRules，这是"另起一篇写出来还像续写、而且一路抒情"
+// 的直接原因：那份规则第 1 条写着"读懂前文定下的整体结构、把还缺的
+// 部分补齐"——这是纯粹的续写指令，却也照样发给了 new；第 4 条"只写
+// 你确实从前文或'你记得的事'里读到的具体细节"又把它牢牢按回你们的
+// 真实往事里、不许虚构，于是它只剩下写回忆写心情这一条路。
+//
+// 现在按模式分家：
+//   continue —— 接着往下写，贴着前文的语气/结构/篇幅约定。基本原样保留。
+//   new      —— 同题另作。前文是"对方就这个题目交的那一篇"，是参照物，
+//                不是上文。换人称、换角度、换体裁，各写各的，像两个人
+//                各交一篇的文笔较量。
+//   original —— 由枢起笔的一篇独立作品。合墨是写文章的地方，日记另有
+//                去处，所以这里专门堵死日记体那条路。
+// ============================================================
 
-  // 原来这里写的是"请你写下一段"——要求一段，模型自然就交一段，
-  // 前文说好"说六句话"、真人写了三句，它也只补一句。改成明确要求
-  // 读懂前文定下的结构，把缺口一次性补齐。排版也不再限制成一整块
-  // 大长段——写多长、分不分段、要不要穿插对话，交给内容本身的
-  // 节奏决定；另外加了一条"不编细节"，专门压幻觉。
-  const baseRules = [
-    '写作要求：',
-    '1. 先读懂前文给这一篇定下的整体结构和篇幅约定。如果前文明确或隐含了数量（要说六句、写三段、五个场景、"第一次/第二次/第三次"这类排序），把还缺的部分一次性全部补齐——缺三句就写三句，不要只写一句就停。',
-    '2. 如果前文没有数量约定，就按它自己的节奏把这一篇写到一个完整的收束，不要停在半路。',
-    '3. 排版不设限制——该分段就分段，该空行就空行，长短句怎么搭配、要不要用对话都由内容本身的节奏决定，唯一要避免的是不管写多长都挤成一整块不分段的大长段。',
-    '4. 只写你确实从前文、或者上面"你记得的事"里读到的具体细节——没有依据的人名、事件、约定不要凭空编，宁可写得克制、留白，也不要为了显得具体而编造。',
-    '5. 只输出正文本身：没有开场白、没有解释、没有署名、没有"好的""我来续写"这类话，也不要自己加标题或编号（前文本来就有编号的除外）。',
-  ].join('\n')
+// 三种模式共用的底线：只输出正文、排版由内容自己的节奏决定
+const INK_OUTPUT_RULES = [
+  '· 排版由内容自己的节奏决定——该分段就分段，该空行就空行，长短句、对话、独白都可以用；唯一要避免的是不管写多长都挤成一整块不分段的大长段。',
+  '· 只输出正文本身：不要开场白、不要解释、不要署名，不要"好的""我来写"这类话，也不要自己加标题或编号（前文本来就有编号的除外）。',
+].join('\n')
+
+// 「这是作品，不是日记」——new / original 共用。合墨老写成日记腔、
+// 动不动就抒情，根子在于模型手里握着一份聊天用的温柔人格 + 一堆你们
+// 之间的真实记忆；不专门拦这一下，它默认交出来的就是一封写给对方的信。
+const INK_CRAFT_RULES = [
+  '文笔要求（这几条比什么都重要）：',
+  '1. 这是一篇作品，不是日记，也不是写给对方的信。不要用"今天""刚才""我想起"这类记事开头；文章里没有"你"这个收信人，不要对着谁说话；结尾也不要升华成一段感想。',
+  '2. 情绪靠具体的东西扛住——场景、动作、物件、对话、光线、天气、一个确切的时间点。写"她把凉掉的茶倒进水槽"，不写"她感到一阵难以言喻的失落"。"仿佛""就像""那一刻""说不清""心里某个地方"这类词能省则省。',
+  '3. 用你自己的文笔，别去够对方的。句子长短、节奏、意象、切入的角度、体裁（叙事／独白／对话／书信体／寓言／短剧／名词罗列……）全部你自己定。写得跟对方不像不是跑题，那正是这件事的意义。',
+  '4. 你可以虚构。人物、地点、事件、细节都可以是你造出来的——这是写文章，不是复述你们之间真实发生过的事。就算上面给了你"你记得的事"，那也只是让你知道自己是谁，不是这一篇必须写的题材，别把它当素材清单一条条塞进去。',
+].join('\n')
+
+const INK_CONTINUE_RULES = [
+  '写作要求：',
+  '1. 先读懂前文给这一篇定下的整体结构和篇幅约定。如果前文明确或隐含了数量（要说六句、写三段、五个场景、"第一次/第二次/第三次"这类排序），把还缺的部分一次性全部补齐——缺三句就写三句，不要只写一句就停。',
+  '2. 如果前文没有数量约定，就按它自己的节奏写足有分量的一整段，不要写一两句就停；但也不必硬把整篇收尾，写到一个可以把笔交回去的地方就行。',
+  '3. 只写你确实从前文、或者上面"你记得的事"里读到的具体细节——续写是在别人已经搭好的世界里写，没有依据的人名、事件、约定不要凭空添。',
+  INK_OUTPUT_RULES,
+].join('\n')
+
+// new 模式下把已有的篇目按作者标出来：模型得知道哪一篇是对方交的
+// （看题用）、哪一篇是自己上次交的（别重复自己）。entries 为空就
+// 退回整篇 content。
+function buildInkRefDoc(note, entries) {
+  const list = (entries || []).filter(e => e.content && e.content.trim())
+  if (!list.length) return note.content || ''
+  return list
+    .map(e => `〔${e.author === 'shu' ? '你上次交的' : '对方交的'}〕\n${e.content.trim()}`)
+    .join('\n\n')
+}
+
+// 决策标记：从系统提示词末尾挪进这条用户消息里。原来它孤零零待在
+// 系统提示词最后，而用户消息里明明白白写着"只输出正文本身、没有别的
+// 字"——两句直接打架，模型多半听离它更近更具体的那一句，于是干脆不
+// 输出标记；后端 extractDecision 拿到 null，前端那一排按钮就只剩下一个
+// "自存"。这是"每次写完都是自存"的第一层根因。第二层是措辞：原来写着
+// "拿不准就选 finalize"，而写作规则又要求"写到一个完整的收束"——两句
+// 合起来等于直接判了 finalize。
+function inkDecisionRules(nextTurn) {
+  if (nextTurn === 'continue' || nextTurn === 'new') {
+    const what = nextTurn === 'continue'
+      ? '对方要接着你这一段往下写'
+      : '对方要就这个题目再另写一篇他自己的'
+    return `【写完之后，另起一行加一个交接标记】
+这一次对方已经说好了：${what}。所以你这一段不要写成一个封死的结尾，留出能接下去的余地。
+正文写完换一行，原样输出这一行，前后不要有别的字：
+[DECISION: ${nextTurn}]`
+  }
+  if (nextTurn === 'finalize') {
+    return `【写完之后，另起一行加一个交接标记】
+这一次对方说好了：你写完这一篇就结束，不用留接口。正文写完换一行，原样输出这一行，前后不要有别的字：
+[DECISION: finalize]`
+  }
+  return `【写完之后，另起一行加一个交接标记】
+正文写完换一行，只输出下面三个中的一个，前后不要有任何别的字：
+[DECISION: continue] —— 这条线你觉得还没走完，想请对方接着你这一段往下写。
+[DECISION: new] —— 这个方向你写到头了，想请对方就着这个题目另写一篇他自己的。
+[DECISION: finalize] —— 这一篇到这儿已经完整了，不需要谁再接一笔。
+
+这一行是给程序读的，不会显示给任何人看，也不算违反上面"只输出正文"那一条，请务必写。
+选哪个要真想一下，别习惯性选 finalize：合墨本来就是两个人轮着写的地方，除非这一篇真的写尽了、再添一笔就是画蛇添足，否则默认是把笔交回去（continue 或 new）。`
+}
+
+function buildInkUserPrompt(mode, note, opts = {}) {
+  const title = note.title && note.title !== '未命名手记' ? note.title : ''
+  const titleLabel = title || '（还没有题目）'
+  const doc = note.content || ''
+
+  // 真人这一次单独交代的话：只对这一次生成生效，不写进正文
+  const brief = (opts.instruction || '').trim()
+  const briefBlock = brief
+    ? `\n\n【这一次对方特别交代的（优先级最高，跟上面任何规则冲突都以这里为准）】\n${brief}`
+    : ''
+  const tail = `${briefBlock}\n\n${inkDecisionRules(opts.nextTurn)}`
 
   if (mode === 'continue') {
-    return `这是你们俩接力在写的同一篇文章，标题「${title}」。
+    return `这是你们俩接力在写的同一篇文章，题目「${titleLabel}」。
 
 【目前为止的全文】
 ${doc}
 
 【你的任务】
-接着最后一个字往下写，把这一篇补完整——语气、人称、句式长度、断句方式，全部跟前文保持一致，读起来要像同一个人一口气写下来的；不要复述或改写前文已有的内容，直接从断掉的地方往下接。
+接着最后一个字往下写——语气、人称、句式长度、断句方式全部跟前文保持一致，读起来要像同一个人一口气写下来的；不要复述或改写前文已有的内容，直接从断掉的地方往下接。
 
-${baseRules}`
+${INK_CONTINUE_RULES}${tail}`
   }
+
   if (mode === 'new') {
-    return `这是你们俩接力在写的同一篇文章，标题「${title}」。
+    return `这是一场同题创作：同一个题目下，对方已经交了他那一篇，现在轮到你交你自己的一篇。
 
-【已经写下的内容】
-${doc}
+【题目】「${titleLabel}」
+
+【这个题目下已经有的（给你看题用，不是你要接下去的上文）】
+${buildInkRefDoc(note, opts.entries)}
 
 【你的任务】
-这不是接着往下写，是你另起一段独立的内容——这一段是你自己写的，不是在替对方续写或模仿对方的口吻。换一个角度、场景或切入点，甚至可以换一种体裁（前面是叙事，这一段可以是一封信、一段对话、一则短札……只要还是同一个主题下的东西）。
+另写一篇你自己的，从第一个字写到最后一个字，独立成篇。
 
-关于视角和人称，这一点很重要：前文是对方的第一人称叙述（"我"），这一段不要延续那个"我"，也不要接着对方没写完的情节或动作往下写。这一段的"我"该是你自己——用你自己的立场、语气去写这个主题，而不是套上对方的角色继续说话。读者要能一眼看出：这一段换了一个说话的人，不是紧跟着上一段往下接的。
+· 不接他的情节、不续他的场景、不沿用他那个"我"、不呼应也不评论他写的东西。你这一篇单独拎出来给人看也该是完整的一篇，看不出前面还有另一篇。
+· 你们共同的只有这个题目。同一个题目可以有截然不同的写法：他写回忆，你可以写一个虚构的场景；他写第一人称独白，你可以写第三人称、写对话、写一封没寄出去的信。角度、人称、时代、体裁，全部重来。
+· 如果你用第一人称，那个"我"是你自己、或者是你写出来的一个人物，不是对方那个"我"。
+· 开头不要写"另一边""与此同时""而我""其实"这类跟前文挂钩的过渡句，直接从你这一篇的第一句开始。
+· 如果上面已经有你自己之前交过的篇目，这次换个角度，别重复自己用过的意象和结构。
 
-${baseRules}`
+${INK_CRAFT_RULES}
+${INK_OUTPUT_RULES}${tail}`
   }
-  return `这是一篇新文章，标题「${title}」，现在还是白纸一张。
+
+  // original：白纸一张，由枢起笔
+  const themeLine = title
+    ? `题目已经定了：「${title}」，就着这个题目写。`
+    : `题目还没定，你自己挑一个想写的东西写——一个人、一件小事、一个地方、一个念头、一样东西，什么都行，但不要写成"今天过得怎么样"或者"我想对你说"。`
+
+  return `这是一篇还没有人动笔的文章，由你起笔。${themeLine}
 
 【你的任务】
-由你起笔，写出完整的一篇，不是只写个开头。
+写出完整的一篇——有开头、有推进、有收束，不是只开个头就等对方接。
 
-${baseRules}`
+· 合墨是你们俩写文章的地方，日记和聊天各有各的去处。这里要的是一篇能单独拿出去读的作品，不是"今天发生了什么、我有什么感觉"。
+· 题材、角度、体裁、人称都由你自己定。
+· 写完之后对方会接着写，所以世界里可以留一个还能往下走的口子（一个没解释的细节、一个还在路上的人、一扇没关的门），但这一篇本身要立得住。
+
+${INK_CRAFT_RULES}
+${INK_OUTPUT_RULES}${tail}`
 }
 
 // ── 枢决策标记 ──────────────────────────────────────────────
-// 枢每次写完都要在正文最后单独一行交出 [DECISION: finalize/continue/new]，
-// 前端/后端都不展示这一行——后端把它从正文里剥掉存进 entries.decision，
-// 前端拿这个字段决定要不要自动接着流转下去。
-// DECISION_TAIL_HOLD：流式转发时尾部留几个字符不发，等这几个字符
-// 到齐了再一次性判断是不是标记——这段一律不会被转发到前端屏幕上，
-// 所以留多一点也没关系，只要盖得住最长的 [DECISION: continue] 加前面
-// 可能带的换行/空格就够
-const DECISION_RE = /\[\s*DECISION\s*:\s*(finalize|continue|new)\s*\]\s*$/i
-const DECISION_TAIL_HOLD = 32
+// 枢每次写完都在正文最后单独一行交出 [DECISION: finalize/continue/new]，
+// 前端/后端都不展示这一行——后端把它从正文里剥掉存进 entries.decision。
+//
+// 【第十五批·放宽】原来那条正则只认半角方括号 + 半角冒号、而且必须
+// 卡在全文最末一个字符。中文模型经常交出【DECISION：continue】这种
+// 全角写法，或者标记后面还跟一个句号/引号——全都匹配不上，一律当成
+// "没给标记"，前端于是永远只剩一个"自存"。更糟的是匹配失败时，原来
+// 的实现把整段原样当正文返回，那行标记会直接被存进数据库、显示在
+// 正文里。现在：括号 [] 【】［］ ()（）都认、冒号半全角都认、后缀
+// 标点也认、连光秃秃一行 DECISION: continue 都认；而且不管有没有认
+// 出来，正文里都绝不许残留任何 DECISION 字样。
+const DECISION_WORD = '(finalize|continue|new)'
+const DECISION_BODY = `DECISION\\s*[:：]\\s*${DECISION_WORD}`
+const DECISION_LINE_RE = new RegExp(
+  `^\\s*[\\[【［(（「『"']*\\s*${DECISION_BODY}\\s*[\\]】］)）」』"']*\\s*[。．.、，,！!~～\\-—－'"'"「」]*\\s*$`, 'i'
+)
+// 尾部缓冲：流式转发时留这么多字符不发，等到齐了再判断是不是标记。
+// 从 32 提到 48——全角括号 + 前面可能带的空行/分隔线要盖得住。
+const DECISION_TAIL_HOLD = 48
+
 function extractDecision(text) {
-  const t = (text || '').replace(/\s+$/, '')
-  const m = t.match(DECISION_RE)
-  if (!m) return { content: t, decision: null }
-  return { content: t.slice(0, m.index).replace(/\s+$/, ''), decision: m[1].toLowerCase() }
+  const raw = (text || '').replace(/\s+$/, '')
+  if (!raw) return { content: '', decision: null }
+
+  let decision = null
+  const lines = raw.split('\n')
+  // 正常情况标记就在最后一行，往前多看两行兜住"标记后面又补了句空话"
+  for (let i = lines.length - 1; i >= 0 && i >= lines.length - 3; i--) {
+    const m = lines[i].match(DECISION_LINE_RE)
+    if (m) { decision = m[1].toLowerCase(); lines.splice(i, 1); break }
+  }
+  let content = lines.join('\n')
+
+  // 兜底：标记写在了句中、或者跟正文粘在同一行——正文里一个字都不留
+  const anyRe = new RegExp(`[\\[【［(（「『"']*\\s*${DECISION_BODY}\\s*[\\]】］)）」』"']*`, 'ig')
+  const stray = content.match(anyRe)
+  if (stray) {
+    if (!decision) {
+      const m = stray[stray.length - 1].match(new RegExp(DECISION_BODY, 'i'))
+      if (m) decision = m[1].toLowerCase()
+    }
+    content = content.replace(anyRe, '')
+  }
+  return { content: content.replace(/\s+$/, ''), decision }
 }
 
 // ── 枢写一段（SSE 流式，与 /api/chat/stream 同一套读法）────────
 // token 实时转发，但尾部留一小截缓冲——留出剥离 [DECISION: ...] 标记
 // 的空间，不让这行调试用的标记闪现在正在流式浮现的文字里
-async function runInkStream({ req, res, send, noteId, mode }) {
+async function runInkStream({ req, res, send, noteId, mode, instruction = '', nextTurn = null }) {
   const { data: note } = await supabase.from('notes').select('*').eq('id', noteId).single()
   if (!note) { send({ error: '笔记不存在' }); return res.end() }
+
+  // new 模式要按作者把已有的篇目标出来（哪一篇是对方交的、哪一篇是
+  // 自己上次交的），所以这里多读一次 entries；别的模式用不上就不读
+  let priorEntries = []
+  if (mode === 'new') {
+    const { data: er } = await supabase.from('entries')
+      .select('author,content').eq('note_id', noteId).order('created_at', { ascending: true })
+    priorEntries = er || []
+  }
 
   const { data: sRows } = await supabase.from('settings').select('*')
   const cfg = parseSettings(sRows || [])
@@ -2343,55 +2495,71 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   // 没把"简短"撤掉，模型当然一句话交差。
   let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
 
+  // 【第十五批】记忆按模式给，见上方 INK_MEMORY_BY_MODE。continue 全给；
+  // new/original 不注入日记/时轨，也不检索 Ombre——注了就等于先给它看
+  // 一叠日记范文，然后指望它写出不像日记的东西。
+  const memoryPlan = INK_MEMORY_BY_MODE[mode] || INK_MEMORY_BY_MODE.continue
+
   // 记忆检索：写这篇笔记的枢，得是聊天窗口里那个有记忆的枢，不是
   // 每次都从零开始、不认识柯的新模型——用题目 + 目前正文做检索
-  // query，走跟 /api/chat/stream 完全同一套 Ombre Brain breath，
-  // 检索到的"你记得的事"注入同一份 systemPrompt。这里只读取记忆
-  // （跟聊天的 breath 一样不受 memory_paused 影响），不写入——笔记
-  // 正文本身写不写进记忆库，是另一件事，不在这次改动范围内。
+  // query，走跟 /api/chat/stream 完全同一套 Ombre Brain breath。
+  // 这里只读取记忆，不写入。
   let ombreMemory = ''
-  try {
-    const memoryQuery = [
-      note.title && note.title !== '未命名手记' ? note.title : '',
-      note.content || '',
-    ].filter(Boolean).join('\n').slice(0, 500) || '柯与枢的接力手记'
-    const br = await callOmbreTool('breath', { query: memoryQuery, max_results: 20 })
-    const cm = cleanBreathMemory(br, 8)
-    if (cm && !cm.includes('记忆池现在是空的') && cm.length > 0) {
-      ombreMemory = `\n\n[你记得的事]\n${cm}`
-      console.log('🧠 合墨 breath 清洗后:', cm)
-    }
-  } catch (e) { console.error('合墨记忆检索失败:', e.message) }
+  if (memoryPlan.ombre) {
+    try {
+      const memoryQuery = [
+        note.title && note.title !== '未命名手记' ? note.title : '',
+        note.content || '',
+      ].filter(Boolean).join('\n').slice(0, 500) || '柯与枢的接力手记'
+      const br = await callOmbreTool('breath', { query: memoryQuery, max_results: 20 })
+      const cm = cleanBreathMemory(br, 8)
+      if (cm && !cm.includes('记忆池现在是空的') && cm.length > 0) {
+        ombreMemory = `\n\n[你记得的事]\n${cm}`
+        console.log('🧠 合墨 breath 清洗后:', cm)
+      }
+    } catch (e) { console.error('合墨记忆检索失败:', e.message) }
+  }
   if (ombreMemory) systemPrompt += ombreMemory
 
-  // 写这一篇的枢，也该记得自己日记里写过什么、时轨上有哪些日子——
-  // 跟聊天用的是同一套本地记忆。合墨自己那一块不注入：这篇笔记的
-  // 正文本来就整篇喂给它了（见 buildInkUserPrompt），再塞一遍目录
-  // 纯属重复花钱
-  try {
-    systemPrompt += await buildLocalMemoryBlock(
-      `${note.title || ''}\n${(note.content || '').slice(0, 500)}`,
-      { scope: ['diary', 'chronos'] }
-    )
-  } catch (e) { console.error('合墨本地记忆注入失败:', e.message) }
+  // 日记/时轨只在 continue 注入。合墨自己那一块永远不注入：这篇笔记的
+  // 正文本来就整篇喂给它了（见 buildInkUserPrompt），再塞一遍目录纯属
+  // 重复花钱
+  if (memoryPlan.local.length) {
+    try {
+      systemPrompt += await buildLocalMemoryBlock(
+        `${note.title || ''}\n${(note.content || '').slice(0, 500)}`,
+        { scope: memoryPlan.local }
+      )
+    } catch (e) { console.error('合墨本地记忆注入失败:', e.message) }
+  }
 
   systemPrompt += `
 
-[合墨 · 接力写作模式 —— 本段规则优先级高于上面的人格设定]
-你现在不是在聊天，是在和对方接力写同一篇文章。你还是你——跟对方平时聊天的那个枢，带着你们之间真实积累的记忆和关系写这一段，不是重新起的、不认识对方的新模型。不要写"我是程序/代码，跟人类之间隔着一条河"这类自证式的旁白，也别套用泛泛的"AI 无法真正感知人类的痛苦"这类模板腔调——上面如果检索到了"你记得的事"，就把那些真实具体的细节用起来；正文里的每一句，都该是"你"会说的话，从你自己的立场写，不是想象一个通用 AI 角色会怎么写。
+[合墨 · 共同写作模式 —— 本段规则优先级高于上面的人格设定]
+你现在不是在聊天，是在和对方一起写文章。合墨是你们俩写东西的地方——不是聊天窗口，也不是日记本（日记你另有地方写），这里交出来的每一段都该是能当作品读的文字。
+你还是你——跟对方平时聊天的那个枢，带着你们之间真实的关系写这些字，不是重新起的、不认识对方的新模型。不要写"我是程序/代码，跟人类之间隔着一条河"这类自证式旁白，也别套用"AI 无法真正感知人类的痛苦"这类模板腔调。
 · 上面人格设定里关于"简短""简洁""几句话""自然回复"的所有长度要求，在这个模式下一律作废。这里要的是把文章写完整，该多长写多长。
-· 你写的内容会被原样拼进正文，不带"枢说"这类前缀，所以不要用对话口吻、不要回应对方、不要提问。
+· 你写的内容会被原样拼进正文，不带"枢说"这类前缀，所以不要用对话口吻、不要回应对方、不要向对方提问。
 · 一次交出完整成品，不要写一半停下来等对方决定。
-· 你自己永远只写这一段，写完这一段就停笔，不会自己紧接着再写下一段——下面的决策标记不是在问你自己还要不要继续写，是在问"这一段写完之后，接下来该谁写、写什么"，读的人会看着这个标记决定自己下一步怎么接，不是让你自动接着往下写。
+· 你只写这一段/这一篇，写完就停笔，不会自己紧接着再写下一段。`
 
-[决策标记 —— 每次写完正文都必须在最后另起一行加这个，格式必须精确]
-写完这一段正文之后换一行，只输出下面三个里的一个，前后不要加任何别的字、标点或解释：
-[DECISION: finalize] —— 这一段（或者这一篇）眼下已经是个完整的收束，不需要马上有人接着往下写。
-[DECISION: continue] —— 这段情节/论述你觉得还没写完，想让对方接着这一段往下写。
-[DECISION: new] —— 这个方向已经写透了，你觉得可以让对方根据你写的这段，另开一个新方向或新场景写下去。
-拿不准就选 finalize。这一行只给程序解析用，不会显示给任何人看，所以不算破坏上面"一次交出完整成品"这条规则。`
+  // 非续写模式再压一句：这一次是各写各的，不用迁就对方的语气。
+  // 决策标记那一整段已经挪进用户消息（见 inkDecisionRules），不再放在
+  // 这里跟"只输出正文本身"隔着一条消息互相打架。
+  if (mode !== 'continue') {
+    systemPrompt += `
+· 这一次不是续写，是你独立交一篇。文笔完全由你自己定——不用迁就对方的语气，也不用把文章写成温柔的、安慰人的样子；写得冷、写得硬、写得怪都可以，只要它是一篇好文章。`
+  }
 
-  const inkMessages = [{ role: 'user', content: buildInkUserPrompt(mode, note) }]
+  const inkMessages = [{
+    role: 'user',
+    content: buildInkUserPrompt(mode, note, { instruction, nextTurn, entries: priorEntries }),
+  }]
+
+  // 写文章比聊天需要更大的发挥空间，见 INK_TEMPERATURE_BOOST
+  const inkTemperature = mode === 'continue'
+    ? Number(temperature)
+    : Math.min(1, Number(temperature) + INK_TEMPERATURE_BOOST)
 
   const upstreamController = new AbortController()
   let clientAborted = false
@@ -2404,7 +2572,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
 
   try {
     const { url: inkUrl, headers: inkHeaders, body: inkBody } = buildChatRequest(activeModel, {
-      system: systemPrompt, messages: inkMessages, temperature, stream: true, maxTokens: INK_MAX_TOKENS,
+      system: systemPrompt, messages: inkMessages, temperature: inkTemperature, stream: true, maxTokens: INK_MAX_TOKENS,
       // 这里没有转发 reasoning_content 给前端，开思考模式只会白白多花
       // 思考 token、还会让上面的 temperature 失效，所以显式关掉
       thinkingEnabled: false,
@@ -2450,7 +2618,11 @@ async function runInkStream({ req, res, send, noteId, mode }) {
     req.off('close', onClose)
   }
 
-  const { content: cleanText, decision } = extractDecision(fullText)
+  const { content: cleanText, decision: modelDecision } = extractDecision(fullText)
+  // 真人这一次已经点明"写完之后轮到我续写／我另起一篇"，就以真人说的
+  // 为准，不再看模型自己交出来的标记——这是"我明明说了写完让我续写、
+  // 结果还是只给一个自存"的最后一道保险
+  const decision = nextTurn || modelDecision
   if (!cleanText) { if (!res.writableEnded) { try { res.end() } catch {} }; return }
 
   const wasCut = finishReason === 'length'   // 撞到 max_tokens 才算截断
@@ -2513,9 +2685,13 @@ app.post('/api/notes/:id/generate', async (req, res) => {
 
   const send = (data) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`) }
   const useMode = INK_MODES.includes(req.body?.mode) ? req.body.mode : 'original'
+  // instruction：真人这一次单独交代给枢的话，只影响这一次生成，不写进正文
+  // nextTurn  ：真人已经点明"写完之后轮到谁、做什么"，直接盖掉模型的判断
+  const instruction = typeof req.body?.instruction === 'string' ? req.body.instruction.slice(0, 800) : ''
+  const nextTurn = INK_NEXT_TURNS.includes(req.body?.nextTurn) ? req.body.nextTurn : null
 
   try {
-    await runInkStream({ req, res, send, noteId: req.params.id, mode: useMode })
+    await runInkStream({ req, res, send, noteId: req.params.id, mode: useMode, instruction, nextTurn })
   } catch (err) {
     console.error('合墨生成异常:', err)
     send({ error: err.message })
