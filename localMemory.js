@@ -1,5 +1,5 @@
 /**
- * localMemory.js —— 家机的「本地记忆」：日记 / 合墨 / 时轨
+ * localMemory.js —— 家机的「本地记忆」：刚才 / 日记 / 合墨 / 时轨
  * ============================================================
  * 【为什么需要这个文件】
  * 在这之前，枢在聊天里能想起来的东西只有两个来源：
@@ -16,8 +16,23 @@
  * 一条 60 字摘要，而且只对"那次改动之后新写的日记"生效，历史日记一篇
  * 都进不去；合墨和时轨则完全没有。这个文件把这三块一次补齐。
  *
+ * 【2026-08-12 追加：为什么又多了一个「刚才」块】
+ * 上面那三块解决的是"我写过什么"——内容记忆。但柯问的是另一种东西：
+ * 「你记得刚刚写日记了吗」「我们刚刚是不是一起写了点什么」。这问的
+ * 不是内容，是**事件**：我刚刚做过这个动作。
+ * 原来的目录里，日记只有日期（2026-08-12），合墨只有 updated_at 切到
+ * 前 10 位（也只到日）——"刚刚"这个概念在整份 prompt 里根本不存在。
+ * 于是枢的处境是：他手上有今天日记的全文，却完全不知道这篇是十分钟
+ * 前刚落笔的，还是三天前就躺在那儿了。人回忆"刚做过的事"主要靠时间
+ * 远近，不靠关键词，所以这一块单独按时间轴排，且只排最近 48 小时，
+ * 每条都带"20 分钟前 / 3 小时前"这种相对时间。
+ *
+ * 关键是：这一块**不需要新建任何事件表**。diary.created_at 和
+ * entries.created_at 本来就在写，把它们按时间捞出来就是一份现成的
+ * 行为流水；历史数据也自动生效，不用做任何迁移。
+ *
  * 【为什么是直接注入，而不是再接一层向量检索】
- * 这三块数据量本来就很小（日记一天最多一篇、手记几十篇、时轨几条），
+ * 这几块数据量本来就很小（日记一天最多一篇、手记几十篇、时轨几条），
  * 一次 Supabase 查询就全拿到了，不需要 embedding 服务、更不需要多花
  * 一次模型调用去检索几十条数据——那是本末倒置。策略是
  * 「常驻索引 + 命中展开」：
@@ -29,8 +44,8 @@
  * 按日期命中，完全不依赖关键词碰巧对得上。
  *
  * 【它跟 Ombre Brain 的分工】
- * 记忆池回答"我记得他说过 X"；这个文件回答"我写过 / 我们一起写过 /
- * 我们记着的日子是 X"。两条路并行，互不覆盖。
+ * 记忆池回答"我记得他说过 X"；这个文件回答"我刚刚做了 X / 我写过 X /
+ * 我们一起写过 X / 我们记着的日子是 X"。两条路并行，互不覆盖。
  * ============================================================
  */
 
@@ -50,6 +65,15 @@ const CFG = {
   noteHitCount:    2,
   noteHitChars:    460,
 
+  // ── 「刚才」块：只看最近这么多小时，最多列这么多条 ──────────
+  // 48 小时是刻意选的：短于 24 小时的话，"昨天晚上写的那篇"就掉出
+  // 窗口了，而人绝对会把昨晚的事算作"刚刚/最近"；长于 48 小时又会
+  // 让"刚刚"这个词失去意义，还白占 token。真要往前翻，目录和全文
+  // 命中那两条路一直都在
+  recentHours:     48,
+  recentMax:       8,
+  recentChars:     26,   // 每条事件里引用正文开头多少字
+
   includePeriod:   true, // 潮汐（经期）要不要让枢知道；不想给就改成 false
   cacheMs:         15000,
 }
@@ -63,6 +87,25 @@ const bjDate = (d = new Date()) => {
 }
 const daysBetween = (a, b) =>
   Math.round((new Date(b).getTime() - new Date(a).getTime()) / DAY)
+
+// ── 相对时间：「刚才」块的核心。模型对 ISO 时间戳做减法这件事非常
+//    不可靠（尤其还要先换算时区），与其给它 2026-08-12T09:41:07Z 让
+//    它自己算，不如直接把算好的"23 分钟前"递到它面前 ────────────
+function relTime(when) {
+  const t = new Date(when).getTime()
+  if (!t || Number.isNaN(t)) return ''
+  const min = Math.floor((Date.now() - t) / 60000)
+  if (min < 2)    return '就在刚刚'
+  if (min < 60)   return `大约 ${min} 分钟前`
+  const hours = Math.floor(min / 60)
+  if (hours < 24) return `大约 ${hours} 小时前`
+  const b = new Date(t + 8 * 3600 * 1000)
+  const hm = `${pad2(b.getUTCHours())}:${pad2(b.getUTCMinutes())}`
+  const days = Math.floor(min / 1440)
+  if (days === 1) return `昨天 ${hm}`
+  if (days === 2) return `前天 ${hm}`
+  return `${days} 天前`
+}
 
 // ── 中文没有空格，上分词器又太重，这里用 2-gram 重合度打分：把两段
 //    文字都切成"相邻两字"的集合，数交集大小。对"你还记得我们写的那篇
@@ -128,9 +171,12 @@ function createLocalMemory({ supabase }) {
     if (cache && Date.now() - cacheAt < CFG.cacheMs) return cache
     // 任何一张表查失败都不能拖垮整次回复——各自兜底成空数组
     const safe = p => p.then(r => r.data || []).catch(() => [])
-    const [diary, notes, countdowns, periods, settings] = await Promise.all([
+    const recentSince = new Date(Date.now() - CFG.recentHours * 3600 * 1000).toISOString()
+    const [diary, notes, countdowns, periods, settings, recentEntries] = await Promise.all([
+      // created_at 是「刚才」块判断"这篇是什么时候落的笔"的唯一依据，
+      // 原来没查它，所以整份 prompt 里日记最细只到"哪一天"
       safe(supabase.from('diary')
-        .select('date,content,skipped')
+        .select('date,content,skipped,created_at')
         .order('date', { ascending: false }).limit(150)),
       safe(supabase.from('notes')
         .select('id,title,content,board,pinned_at,updated_at')
@@ -142,8 +188,14 @@ function createLocalMemory({ supabase }) {
         .select('start_date,end_date')
         .order('start_date', { ascending: false }).limit(24)),
       safe(supabase.from('settings').select('*')),
+      // 合墨的行为流水。只捞最近 48 小时，条数天然很少（人一天落笔
+      // 撑死十几段），不会因为这一条查询把接口拖慢
+      safe(supabase.from('entries')
+        .select('note_id,author,mode,content,created_at')
+        .gte('created_at', recentSince)
+        .order('created_at', { ascending: false }).limit(40)),
     ])
-    cache = { diary, notes, countdowns, periods, settings }
+    cache = { diary, notes, countdowns, periods, settings, recentEntries }
     cacheAt = Date.now()
     return cache
   }
@@ -164,6 +216,59 @@ function createLocalMemory({ supabase }) {
       })
       return map
     } catch { return {} }
+  }
+
+  // ── 刚才 · 你最近做过的事 ──────────────────────────────────
+  // 这一块回答的不是"我写过什么"（那是下面几块的事），而是"我刚刚
+  // 做了什么"。数据全部来自已有的表，不需要任何事件表：
+  //   · diary.created_at   → 我什么时候写下（或跳过）了哪天的日记
+  //   · entries.created_at → 我们什么时候各自往哪篇手记里落了笔
+  // 按离现在从近到远排，每条都带算好的相对时间
+  function recentBlock(diary, notes, recentEntries) {
+    const since = Date.now() - CFG.recentHours * 3600 * 1000
+    const events = []
+
+    // 标题在 notes 里查得到就用真标题；查不到（极少数：这篇被挤出了
+    // 最近 80 篇的窗口）也不能空着，给个说得过去的指代
+    const titleOf = (id) => {
+      const n = (notes || []).find(x => x.id === id)
+      const t = n?.title
+      return (t && t !== '未命名手记') ? `《${t}》` : '那篇还没起名字的手记'
+    }
+
+    ;(diary || []).forEach(d => {
+      const t = new Date(d.created_at || '').getTime()
+      if (!t || Number.isNaN(t) || t < since) return
+      events.push({
+        t,
+        text: (d.skipped || !d.content)
+          ? `你翻看了 ${d.date} 这天，想了想，决定这天不写日记。`
+          : `你写下了 ${d.date} 这天的日记，开头是「${oneLine(d.content, CFG.recentChars)}」。`,
+      })
+    })
+
+    ;(recentEntries || []).forEach(e => {
+      const t = new Date(e.created_at || '').getTime()
+      if (!t || Number.isNaN(t) || t < since) return
+      // 这份 prompt 里「你」＝枢自己，「他」＝柯
+      const who = e.author === 'shu' ? '你' : '他'
+      const act = e.mode === 'original' ? '起了个头'
+        : e.mode === 'new' ? '另起了一段新的'
+        : '接着往下写了一段'
+      events.push({
+        t,
+        text: `${who}在合墨里，往${titleOf(e.note_id)}${act}，写的是「${oneLine(e.content, CFG.recentChars)}」。`,
+      })
+    })
+
+    if (!events.length) return ''
+    events.sort((a, b) => b.t - a.t)
+    const lines = events.slice(0, CFG.recentMax).map(e => `- ${relTime(e.t)}：${e.text}`)
+
+    return '\n\n[刚才 · 你最近做过的事]\n' +
+      '下面这些是最近两天里你们真实做过的事，按离现在从近到远排。这不是谁递给你的记录，是你自己刚做完的事——你在场，你知道自己做了。\n' +
+      '所以他要是问"你记不记得刚刚写日记了""我们刚刚是不是一起写了点什么"，答案就在这几行里：直接说记得，并且说得出大概是什么时候、写的是什么，别反问他"你是指哪一次"。\n' +
+      lines.join('\n')
   }
 
   // ── 星历 · 日记 ────────────────────────────────────────────
@@ -221,7 +326,12 @@ function createLocalMemory({ supabase }) {
 
     const index = real.slice(0, CFG.noteIndexCount).map(n => {
       const tag = [n.pinned_at ? '置顶' : '', n.board || ''].filter(Boolean).join(' · ')
-      return `- 《${n.title || '未命名手记'}》${tag ? `（${tag}）` : ''} · ${String(n.updated_at || '').slice(0, 10)} · ${oneLine(n.content, CFG.noteIndexChars)}`
+      // 最近动过的几篇顺手标一句相对时间——目录原本只有日期，"今天下午
+      // 刚改过"和"这个月初改的"看上去一模一样
+      const t = new Date(n.updated_at || '').getTime()
+      const fresh = (t && Date.now() - t < CFG.recentHours * 3600 * 1000)
+        ? `（${relTime(n.updated_at)}刚动过）` : ''
+      return `- 《${n.title || '未命名手记'}》${tag ? `（${tag}）` : ''} · ${String(n.updated_at || '').slice(0, 10)}${fresh} · ${oneLine(n.content, CFG.noteIndexChars)}`
     })
 
     let out = '\n\n[合墨 · 你们一起写的手记]\n合墨是你和他轮流往同一篇文章里落笔的地方，里面有你亲手写下的段落。这些是你参与过的创作，不是读到的素材。'
@@ -281,17 +391,24 @@ function createLocalMemory({ supabase }) {
    * @param {string} query      触发这次生成的那句话（聊天=用户消息；
    *                            合墨=标题+正文；日记=当天对话）
    * @param {object} opts
-   * @param {string[]} opts.scope  要哪几块，默认三块全要
+   * @param {string[]} opts.scope  要哪几块，默认四块全要。
+   *                               'recent' 只对聊天有意义——写日记 /
+   *                               写合墨的时候告诉他"你刚写了日记"会
+   *                               让他在正文里绕回来说这件事，调用处
+   *                               自己把它摘掉
    * @returns {Promise<string>}    没有任何内容时返回空字符串
    */
   async function buildLocalMemoryBlock(query, opts = {}) {
-    const scope = opts.scope || ['diary', 'ink', 'chronos']
+    const scope = opts.scope || ['recent', 'diary', 'ink', 'chronos']
     try {
-      const { diary, notes, countdowns, periods, settings } = await loadRaw()
+      const { diary, notes, countdowns, periods, settings, recentEntries } = await loadRaw()
       const qGrams = shingles(query)
       const qDates = datesInQuery(query)
 
       let out = ''
+      // 「刚才」排在最前面：位置越靠前越显眼，而这一块回答的恰恰是
+      // 最容易被问、以前又最答不上来的那类问题
+      if (scope.includes('recent'))  out += recentBlock(diary, notes, recentEntries)
       if (scope.includes('chronos')) out += chronosBlock(settings, countdowns, periods)
       if (scope.includes('diary'))   out += diaryBlock(diary, qGrams, qDates)
       if (scope.includes('ink'))     out += await inkBlock(notes, qGrams)
@@ -300,7 +417,7 @@ function createLocalMemory({ supabase }) {
       // 收尾这段很关键。不加的话有两种典型跑偏：一是一被问就把上面整个
       // 目录背一遍（人不会没事背自己的日记目录）；二是用"根据您提供的
       // 资料显示"这种腔调，那会把"他自己记得"这层质感整个毁掉
-      out += '\n\n[关于上面这几块的说明]\n这些都是你自己的东西：日记是你写的，手记里有你落的笔，日子是你们一起记着的。回想时用第一人称，说"我那天写过""我们那篇里写到"，不要说"根据记录/资料显示"。他没问的时候不要主动把目录整个念一遍，只在真的说到相关的事时自然带出来。想不起细节就说想不起来了，不要编。'
+      out += '\n\n[关于上面这几块的说明]\n这些都是你自己的东西：那些事是你做的，日记是你写的，手记里有你落的笔，日子是你们一起记着的。回想时用第一人称，说"我刚写完""我那天写过""我们那篇里写到"，不要说"根据记录/资料显示"。他没问的时候不要主动把目录整个念一遍，只在真的说到相关的事时自然带出来。想不起细节就说想不起来了，不要编。'
       return out
     } catch (e) {
       console.error('本地记忆拼装失败:', e.message)
