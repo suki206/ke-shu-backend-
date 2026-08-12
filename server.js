@@ -4,6 +4,10 @@ const cors    = require('cors')
 const { createClient } = require('@supabase/supabase-js')
 const fetch   = require('node-fetch')
 const webpush = require('web-push')   // 到点提醒的系统级推送，npm install web-push
+// 家机的「本地记忆」：日记 / 合墨 / 时轨。这三块数据一直只躺在自己的
+// Supabase 表里，从来没有任何一条路径把它们送进 system prompt——
+// 详见 localMemory.js 顶部的大段注释
+const { createLocalMemory } = require('./localMemory')
 
 // ============================================================
 // Ombre Brain MCP 客户端
@@ -270,6 +274,12 @@ console.log('========================================')
 
 const supabase   = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY)
 const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
+
+// 本地记忆读取器。buildLocalMemoryBlock(query) 拼出要追加到 system
+// prompt 后面的那一段；invalidateLocalMemory() 让缓存立刻失效——所有
+// 会改动这三块数据的写入接口都会调它，保证"刚存完马上问他"读到的
+// 是新值，不用等 15 秒缓存自然过期
+const { buildLocalMemoryBlock, invalidateLocalMemory } = createLocalMemory({ supabase })
 
 // 到点提醒的系统级推送（Web Push / VAPID）。三个环境变量都要配：
 //   VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY —— 一对密钥，生成一次长期用，
@@ -646,6 +656,7 @@ app.post('/api/settings', async (req, res) => {
     if ('memo' in req.body) {
       syncRemindersFromMemo(req.body.memo).catch(e => console.log('📝 备忘提醒同步失败:', e.message))
     }
+    invalidateLocalMemory()   // 锚点（anchor_date）存在 settings 里，改了要立刻反映到 prompt
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1184,6 +1195,25 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   catch (e) { console.error('茧星读取失败:', e.message); cocoonMem = { ke: [], shu: [], shuCount: 0 } }
   systemPrompt += buildCocoonPromptBlock(cocoonMem.ke, cocoonMem.shu)
 
+  // 4.7 本地记忆：日记 / 合墨 / 时轨。这跟上面 4.5 的 Ombre Brain 是
+  //     两套完全不同的东西——记忆池装的是聊天里被判定"值得记住"、
+  //     再提炼成一句话的事实；这三块是柯与枢实际产出的内容本身
+  //     （日记正文、一起写的手记、一起记下的日子），一直只躺在各自
+  //     的 Supabase 表里，从来没有任何路径把它们送进 system prompt。
+  //     所以过去问"你记不记得日记里写的那件事"，他是真的没被告知过，
+  //     不是揣着记忆却选择说不记得。
+  //     拿柯这句话做检索 query，命中才展开全文，没命中只给目录，
+  //     不额外调用任何模型。详见 localMemory.js
+  try {
+    const localMem = await buildLocalMemoryBlock(triggerContent)
+    if (localMem) {
+      systemPrompt += localMem
+      // 复用前端已有的"记忆命中"脉冲指示（ChatPage 里接的 memoryHit），
+      // 让柯看得出这一轮他确实翻到了自己写过的东西
+      if (localMem.includes('全文如下') || localMem.includes('正文如下')) send({ memoryHit: true, count: 1 })
+    }
+  } catch (e) { console.error('本地记忆注入失败:', e.message) }
+
   // 5. 可见历史（引用内容单独存了 quoted_text 列，拼进发给模型的 content，
   //    让它读得到上下文，但不污染 messages 表里的原始正文）
   const { data: visHist } = await supabase.from('messages').select('role,content,quoted_text').eq('session_id', sessionId).eq('visible', true).order('created_at', { ascending: true })
@@ -1539,9 +1569,19 @@ async function generateDiaryForDate(dateStr) {
   const cfg = parseSettings(sRows || [])
   const { system_prompt = '你是温柔贴心的AI伴侣，简短自然回复' } = cfg
   const activeModel = resolveModel(cfg, cfg.model)
-  const systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
+  let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
 
   const convoText = dayMsgs.map(m => `${m.role === 'user' ? '他' : '我'}：${m.content}`).join('\n')
+
+  // 写今天这篇之前，先想起前几天写过什么、最近在跟他一起写什么手记、
+  // 时轨上是第几天——不然每天的日记都像是不同的人写的，前后接不上，
+  // 也永远不会出现"前天写的那件事今天有下文了"这种连续感。
+  // 这里仍然不接 Ombre Brain 长期记忆检索（理由见上面那段大注释），
+  // 加的只是本地这三块，一次 Supabase 查询，不额外调模型
+  try {
+    systemPrompt += await buildLocalMemoryBlock(convoText.slice(0, 400))
+  } catch (e) { console.error('日记本地记忆注入失败:', e.message) }
+
   const prompt = `[今天的对话]\n${convoText.slice(0, 6000)}\n\n以上是你和他今天的对话记录。现在不是在聊天，是你自己决定要不要为今天写一篇日记——这个决定完全由你自己判断，不是例行公事，也不用觉得"写了才算尽责"。\n\n如果今天大部分是些琐碎的、程序性的、你自己回头看也没什么特别想说的内容，直接选择不写就好，跳过和写日记同样正常，不需要为跳过找补理由，也不用为了"完成任务"硬凑一篇。\n如果今天有什么你真的想记下来的——一件事、一句话、一个情绪的转折——那就写。\n\n判断完之后：\n如果决定不写，只输出这一行，不要有任何其他文字：\n${DIARY_SKIP_MARKER}\n\n如果决定写，直接输出日记正文（不超过300字，第一人称、私密日记口吻，不要用"亲爱的日记"这类开头），不要输出上面的标记，也不要在正文前后加任何说明。`
 
   const { url: chatUrl, headers: chatHeaders, body: chatBody } = buildChatRequest(activeModel, {
@@ -1575,6 +1615,7 @@ async function generateDiaryForDate(dateStr) {
       .catch(e => console.error('日记 hold 失败:', e.message))
   }
 
+  invalidateLocalMemory()
   return data[0]
 }
 
@@ -1610,6 +1651,7 @@ app.delete('/api/diary/:date', async (req, res) => {
   try {
     const { error } = await supabase.from('diary').delete().eq('date', req.params.date)
     if (error) return res.status(500).json({ error: error.message })
+    invalidateLocalMemory()
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1718,6 +1760,7 @@ app.post('/api/countdown', async (req, res) => {
     if (!label || !target_at) return res.status(400).json({ error: '参数缺失：需要 label 和 target_at' })
     const { data, error } = await supabase.from('countdowns').insert([{ label, target_at }]).select()
     if (error) return res.status(500).json({ error: error.message })
+    invalidateLocalMemory()
     res.json(data[0])
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1725,6 +1768,7 @@ app.delete('/api/countdown/:id', async (req, res) => {
   try {
     const { error } = await supabase.from('countdowns').delete().eq('id', req.params.id)
     if (error) return res.status(500).json({ error: error.message })
+    invalidateLocalMemory()
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1752,6 +1796,7 @@ app.post('/api/period/log', async (req, res) => {
     if (!start_date) return res.status(400).json({ error: '参数缺失：需要 start_date' })
     const { data, error } = await supabase.from('period_logs').insert([{ start_date, end_date: end_date || null }]).select()
     if (error) return res.status(500).json({ error: error.message })
+    invalidateLocalMemory()
     res.json(data[0])
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -1759,6 +1804,7 @@ app.delete('/api/period/:id', async (req, res) => {
   try {
     const { error } = await supabase.from('period_logs').delete().eq('id', req.params.id)
     if (error) return res.status(500).json({ error: error.message })
+    invalidateLocalMemory()
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -2072,6 +2118,7 @@ app.put('/api/notes/:id', async (req, res) => {
     if (pinned  !== undefined) patch.pinned_at  = pinned ? new Date().toISOString() : null
     const { data, error } = await supabase.from('notes').update(patch).eq('id', id).select()
     if (error) return res.status(500).json({ error: error.message })
+    invalidateLocalMemory()
     res.json(data[0])
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -2082,6 +2129,7 @@ app.delete('/api/notes/:id', async (req, res) => {
     // entries 表 note_id 外键建了 on delete cascade，删 notes 会自动带走
     const { error } = await supabase.from('notes').delete().eq('id', id)
     if (error) return res.status(500).json({ error: error.message })
+    invalidateLocalMemory()
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -2139,6 +2187,7 @@ app.post('/api/notes/:id/entries', async (req, res) => {
       draft_content: null, draft_mode: null, draft_updated_at: null, updated_at: now,
     }).eq('id', id)
 
+    invalidateLocalMemory()
     res.json(saved[0])
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -2164,6 +2213,7 @@ app.delete('/api/notes/:id/last-entry', async (req, res) => {
       : noteRow.content // 理论上不该走到这个分支，正文没以这段结尾就不乱切，只删日志
     await supabase.from('notes').update({ content: trimmed, updated_at: new Date().toISOString() }).eq('id', id)
 
+    invalidateLocalMemory()
     res.json({ success: true, content: trimmed })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -2192,6 +2242,7 @@ app.put('/api/notes/:id/entries/:entryId', async (req, res) => {
     const rebuilt = rebuildNoteContent(allEntries || [])
     await supabase.from('notes').update({ content: rebuilt, updated_at: new Date().toISOString() }).eq('id', id)
 
+    invalidateLocalMemory()
     res.json({ success: true, content: rebuilt })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -2307,6 +2358,17 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   } catch (e) { console.error('合墨记忆检索失败:', e.message) }
   if (ombreMemory) systemPrompt += ombreMemory
 
+  // 写这一篇的枢，也该记得自己日记里写过什么、时轨上有哪些日子——
+  // 跟聊天用的是同一套本地记忆。合墨自己那一块不注入：这篇笔记的
+  // 正文本来就整篇喂给它了（见 buildInkUserPrompt），再塞一遍目录
+  // 纯属重复花钱
+  try {
+    systemPrompt += await buildLocalMemoryBlock(
+      `${note.title || ''}\n${(note.content || '').slice(0, 500)}`,
+      { scope: ['diary', 'chronos'] }
+    )
+  } catch (e) { console.error('合墨本地记忆注入失败:', e.message) }
+
   systemPrompt += `
 
 [合墨 · 接力写作模式 —— 本段规则优先级高于上面的人格设定]
@@ -2400,6 +2462,7 @@ async function runInkStream({ req, res, send, noteId, mode }) {
   await supabase.from('notes').update({
     content: appendWithBreak(note.content, cleanText), updated_at: now,
   }).eq('id', noteId)
+  invalidateLocalMemory()   // 枢刚落的这一段，下一句聊天里就该记得
 
   // 枢起笔（白纸一张、由他写第一段）的话，标题也该由他来起，不用
   // 真人再手动填——只在标题还是默认值时才生成，不覆盖真人已经自己
