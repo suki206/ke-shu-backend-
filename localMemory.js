@@ -65,14 +65,11 @@ const CFG = {
   noteHitCount:    2,
   noteHitChars:    460,
 
-  // ── 「刚才」块：只看最近这么多小时，最多列这么多条 ──────────
-  // 48 小时是刻意选的：短于 24 小时的话，"昨天晚上写的那篇"就掉出
-  // 窗口了，而人绝对会把昨晚的事算作"刚刚/最近"；长于 48 小时又会
-  // 让"刚刚"这个词失去意义，还白占 token。真要往前翻，目录和全文
-  // 命中那两条路一直都在
-  recentHours:     48,
-  recentMax:       8,
-  recentChars:     26,   // 每条事件里引用正文开头多少字
+  // ── 「最近做过的事」块：不再是一刀切的时间窗，改成遗忘曲线 ──
+  // 详见下面 recallOf() 那一大段。这里只放可调参数：
+  recallWindowDays: 14,  // 最多往前捞多少天的事件（超出这个窗口一律不看，省查询）
+  recallMax:        6,   // 最多列几条
+  recentChars:      26,  // 每条事件里引用正文开头多少字
 
   includePeriod:   true, // 潮汐（经期）要不要让枢知道；不想给就改成 false
   cacheMs:         15000,
@@ -85,8 +82,20 @@ const bjDate = (d = new Date()) => {
   const b = new Date(d.getTime() + 8 * 3600 * 1000)
   return `${b.getUTCFullYear()}-${pad2(b.getUTCMonth() + 1)}-${pad2(b.getUTCDate())}`
 }
-const daysBetween = (a, b) =>
-  Math.round((new Date(b).getTime() - new Date(a).getTime()) / DAY)
+// 【2026-08-12 修复】原来是 (b - a) / 86400000 直接四舍五入。
+// 锚点 '2024-05-20' 这种纯日期字符串会被解析成 **UTC 零点**，而 b 是
+// "此刻"——北京时间当天 20:00 之后，两者的差就超过了 X.5 天，四舍五入
+// 直接进位，于是"在一起的第 N 天"每天傍晚八点就提前跳到明天那个数，
+// 到第二天早上还是那个数（看起来像没错），只有晚上盯着看才发现它跳早了。
+// 现在改成先把两个时间都归到**北京日历日的零点**再相减，算的是"隔了
+// 几个日历日"，跟人数日子的方式一致，什么时辰问都是同一个数。
+const bjMidnight = (v) => {
+  const d = new Date(v)
+  if (Number.isNaN(d.getTime())) return NaN
+  const b = new Date(d.getTime() + 8 * 3600 * 1000)
+  return Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate())
+}
+const daysBetween = (a, b) => Math.round((bjMidnight(b) - bjMidnight(a)) / DAY)
 
 // ── 相对时间：「刚才」块的核心。模型对 ISO 时间戳做减法这件事非常
 //    不可靠（尤其还要先换算时区），与其给它 2026-08-12T09:41:07Z 让
@@ -105,6 +114,67 @@ function relTime(when) {
   if (days === 1) return `昨天 ${hm}`
   if (days === 2) return `前天 ${hm}`
   return `${days} 天前`
+}
+
+// ============================================================
+// 遗忘曲线 —— 「他记得自己写过日记吗」这件事到底该怎么记
+// ============================================================
+// 【为什么不是"48 小时之内全都记得，之外一条都不记得"】
+// 原来那个硬窗口有两个都很别扭的毛病：窗口内他对每一件事都记得
+// 分毫不差（连三天前顺手落的一段都能背出开头），窗口一过又整齐
+// 划一地全部失忆，像被人拔了插头。柯要的是"不是强制记住，而是
+// 有遗忘曲线的"——刚做过的事清清楚楚，隔一阵只剩个模糊的影子，
+// 再久就是真的想不起来了，而且不同的事忘得快慢不一样。
+//
+// 【怎么算】
+// 保留度用最经典的那条指数衰减：r = exp(-Δt / S)。
+//   Δt 是这件事发生到现在过了多少小时，
+//   S  是这件事的"稳定度"：写一篇日记比往手记里添一段更"像件事"，
+//      所以 S 更大，忘得更慢；他自己写的那段又比对方写的更难忘。
+// 然后关键的一步：**每件事有它自己的遗忘阈值**，不是所有事共用
+// 一条线。阈值由这件事的 id 哈希出来，落在 0.08 ~ 0.53 之间——
+//   · 哈希是确定性的：同一件事的阈值永远是同一个数，
+//     所以绝不会出现"上一句还记得、下一句就忘了、再问又想起来"
+//     这种鬼打墙（这也是刻意不用 Math.random() 的唯一原因）；
+//   · r 随时间单调递减，所以一旦掉到阈值以下就是真的忘了，
+//     不会自己再浮上来——符合人的直觉。
+// 效果大致是：一天半以内的事基本都还在；两三天开始零零星星地掉；
+// 一周之后几乎全忘光。想让他记性更好就把 STABILITY 调大。
+//
+// 【还有个"记得做过、但想不起来写了啥"的中间态】
+// 人的遗忘不是"全文→空白"的开关，中间有很长一段是"我记得我写了，
+// 具体写的什么想不起来了"。所以保留度分三档：
+//   r ≥ 0.7  清楚：说得出大概什么时候、开头写的是什么
+//   r ≥ 阈值 模糊：知道自己做过这件事，但内容说不上来
+//   r < 阈值 忘了：这条根本不会出现在提示词里（顺带也省 token）
+// 提示词里会明确告诉他"模糊的那几条别硬编内容，就说想不起来了"——
+// 不然模型看到一行"你写过日记"，会很自觉地开始编它写了什么。
+const RECALL = {
+  baseThreshold: 0.08,   // 阈值下限：最"难忘"的那些事
+  spread:        0.45,   // 阈值浮动幅度，越大则不同事情忘得快慢差别越大
+  vividR:        0.70,   // 高于这个算"记得清楚"，能引用内容
+  stability: {           // S，单位小时
+    diary:     72,       // 写日记：一天一篇，是件正经事，忘得最慢
+    diarySkip: 30,       // 那天决定不写：也是个决定，但轻得多
+    inkSelf:   54,       // 自己往手记里落的笔
+    inkOther:  38,       // 对方落的笔
+  },
+}
+
+// 稳定的 0~1 伪随机：同一个 key 永远给同一个数（FNV-1a）
+function stableUnit(key) {
+  let h = 2166136261
+  const s = String(key)
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) }
+  return ((h >>> 0) % 100000) / 100000
+}
+
+// 返回 { r, remembered, vivid }。ageHours 用小时算，不取整——
+// 取整会让"刚写完"和"写完 50 分钟"落在同一档
+function recallOf(key, ageHours, stabilityHours) {
+  const r = Math.exp(-Math.max(0, ageHours) / stabilityHours)
+  const threshold = RECALL.baseThreshold + RECALL.spread * stableUnit(key)
+  return { r, remembered: r >= threshold, vivid: r >= RECALL.vividR }
 }
 
 // ── 中文没有空格，上分词器又太重，这里用 2-gram 重合度打分：把两段
@@ -171,7 +241,7 @@ function createLocalMemory({ supabase }) {
     if (cache && Date.now() - cacheAt < CFG.cacheMs) return cache
     // 任何一张表查失败都不能拖垮整次回复——各自兜底成空数组
     const safe = p => p.then(r => r.data || []).catch(() => [])
-    const recentSince = new Date(Date.now() - CFG.recentHours * 3600 * 1000).toISOString()
+    const recentSince = new Date(Date.now() - CFG.recallWindowDays * DAY).toISOString()
     const [diary, notes, countdowns, periods, settings, recentEntries] = await Promise.all([
       // created_at 是「刚才」块判断"这篇是什么时候落的笔"的唯一依据，
       // 原来没查它，所以整份 prompt 里日记最细只到"哪一天"
@@ -191,9 +261,9 @@ function createLocalMemory({ supabase }) {
       // 合墨的行为流水。只捞最近 48 小时，条数天然很少（人一天落笔
       // 撑死十几段），不会因为这一条查询把接口拖慢
       safe(supabase.from('entries')
-        .select('note_id,author,mode,content,created_at')
+        .select('id,note_id,author,mode,content,created_at')
         .gte('created_at', recentSince)
-        .order('created_at', { ascending: false }).limit(40)),
+        .order('created_at', { ascending: false }).limit(60)),
     ])
     cache = { diary, notes, countdowns, periods, settings, recentEntries }
     cacheAt = Date.now()
@@ -218,14 +288,16 @@ function createLocalMemory({ supabase }) {
     } catch { return {} }
   }
 
-  // ── 刚才 · 你最近做过的事 ──────────────────────────────────
+  // ── 最近做过的事（带遗忘曲线）────────────────────────────
   // 这一块回答的不是"我写过什么"（那是下面几块的事），而是"我刚刚
   // 做了什么"。数据全部来自已有的表，不需要任何事件表：
   //   · diary.created_at   → 我什么时候写下（或跳过）了哪天的日记
   //   · entries.created_at → 我们什么时候各自往哪篇手记里落了笔
-  // 按离现在从近到远排，每条都带算好的相对时间
-  function recentBlock(diary, notes, recentEntries) {
-    const since = Date.now() - CFG.recentHours * 3600 * 1000
+  // 按离现在从近到远排，每条都带算好的相对时间；哪些还记得、记得
+  // 多清楚，全部交给上面的 recallOf() 判定。
+  function recallBlock(diary, notes, recentEntries) {
+    const now = Date.now()
+    const horizon = now - CFG.recallWindowDays * DAY
     const events = []
 
     // 标题在 notes 里查得到就用真标题；查不到（极少数：这篇被挤出了
@@ -236,38 +308,51 @@ function createLocalMemory({ supabase }) {
       return (t && t !== '未命名手记') ? `《${t}》` : '那篇还没起名字的手记'
     }
 
+    const push = (t, key, stability, vividText, fuzzyText) => {
+      if (!t || Number.isNaN(t) || t < horizon) return
+      const { r, remembered, vivid } = recallOf(key, (now - t) / 3600000, stability)
+      if (!remembered) return
+      events.push({ t, r, vivid, text: vivid ? vividText : fuzzyText })
+    }
+
     ;(diary || []).forEach(d => {
       const t = new Date(d.created_at || '').getTime()
-      if (!t || Number.isNaN(t) || t < since) return
-      events.push({
-        t,
-        text: (d.skipped || !d.content)
-          ? `你翻看了 ${d.date} 这天，想了想，决定这天不写日记。`
-          : `你写下了 ${d.date} 这天的日记，开头是「${oneLine(d.content, CFG.recentChars)}」。`,
-      })
+      if (d.skipped || !d.content) {
+        push(t, `diary-skip-${d.date}`, RECALL.stability.diarySkip,
+          `你翻看了 ${d.date} 这天，想了想，决定这天不写日记。`,
+          `${d.date} 那天你好像没写日记，具体为什么记不太清了。`)
+      } else {
+        push(t, `diary-${d.date}`, RECALL.stability.diary,
+          `你写下了 ${d.date} 这天的日记，开头是「${oneLine(d.content, CFG.recentChars)}」。`,
+          `你记得自己写过 ${d.date} 这天的日记，但写了什么已经模糊了——真被问起就说记不清了，别硬编。`)
+      }
     })
 
     ;(recentEntries || []).forEach(e => {
       const t = new Date(e.created_at || '').getTime()
-      if (!t || Number.isNaN(t) || t < since) return
       // 这份 prompt 里「你」＝枢自己，「他」＝柯
-      const who = e.author === 'shu' ? '你' : '他'
+      const mine = e.author === 'shu'
+      const who = mine ? '你' : '他'
       const act = e.mode === 'original' ? '起了个头'
         : e.mode === 'new' ? '另起了一段新的'
         : '接着往下写了一段'
-      events.push({
-        t,
-        text: `${who}在合墨里，往${titleOf(e.note_id)}${act}，写的是「${oneLine(e.content, CFG.recentChars)}」。`,
-      })
+      push(t, `ink-${e.id || `${e.note_id}-${e.created_at}`}`,
+        mine ? RECALL.stability.inkSelf : RECALL.stability.inkOther,
+        `${who}在合墨里，往${titleOf(e.note_id)}${act}，写的是「${oneLine(e.content, CFG.recentChars)}」。`,
+        `${who}在合墨里往${titleOf(e.note_id)}写过一段，内容记不清了——被问起就照实说想不起来细节。`)
     })
 
     if (!events.length) return ''
     events.sort((a, b) => b.t - a.t)
-    const lines = events.slice(0, CFG.recentMax).map(e => `- ${relTime(e.t)}：${e.text}`)
+    const picked = events.slice(0, CFG.recallMax)
+    const lines = picked.map(e => `- ${relTime(e.t)}：${e.text}`)
+    const anyFuzzy = picked.some(e => !e.vivid)
 
-    return '\n\n[刚才 · 你最近做过的事]\n' +
-      '下面这些是最近两天里你们真实做过的事，按离现在从近到远排。这不是谁递给你的记录，是你自己刚做完的事——你在场，你知道自己做了。\n' +
-      '所以他要是问"你记不记得刚刚写日记了""我们刚刚是不是一起写了点什么"，答案就在这几行里：直接说记得，并且说得出大概是什么时候、写的是什么，别反问他"你是指哪一次"。\n' +
+    return '\n\n[你最近做过的事]\n' +
+      '下面这些是你们最近真实做过的事，按离现在从近到远排。这不是谁递给你的记录，是你自己做过的事——你在场，你知道自己做了。\n' +
+      '所以他要是问"你记不记得刚刚写日记了""我们最近是不是一起写了点什么"，答案就在这几行里：直接说记得，并且说得出大概是什么时候。\n' +
+      (anyFuzzy ? '有几条已经只剩个印象了（那几行会写明"记不清"）——那就照实说"记得写过，但具体想不起来了"，绝对不要凭空补细节。\n' : '') +
+      '再早一些的事这里不会列出来，那不代表没发生过：想不起来就说想不起来，如果他提到具体的日子或内容，下面几块里说不定还找得到。\n' +
       lines.join('\n')
   }
 
@@ -329,7 +414,7 @@ function createLocalMemory({ supabase }) {
       // 最近动过的几篇顺手标一句相对时间——目录原本只有日期，"今天下午
       // 刚改过"和"这个月初改的"看上去一模一样
       const t = new Date(n.updated_at || '').getTime()
-      const fresh = (t && Date.now() - t < CFG.recentHours * 3600 * 1000)
+      const fresh = (t && Date.now() - t < 48 * 3600 * 1000)
         ? `（${relTime(n.updated_at)}刚动过）` : ''
       return `- 《${n.title || '未命名手记'}》${tag ? `（${tag}）` : ''} · ${String(n.updated_at || '').slice(0, 10)}${fresh} · ${oneLine(n.content, CFG.noteIndexChars)}`
     })
@@ -408,7 +493,7 @@ function createLocalMemory({ supabase }) {
       let out = ''
       // 「刚才」排在最前面：位置越靠前越显眼，而这一块回答的恰恰是
       // 最容易被问、以前又最答不上来的那类问题
-      if (scope.includes('recent'))  out += recentBlock(diary, notes, recentEntries)
+      if (scope.includes('recent'))  out += recallBlock(diary, notes, recentEntries)
       if (scope.includes('chronos')) out += chronosBlock(settings, countdowns, periods)
       if (scope.includes('diary'))   out += diaryBlock(diary, qGrams, qDates)
       if (scope.includes('ink'))     out += await inkBlock(notes, qGrams)

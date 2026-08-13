@@ -196,7 +196,27 @@ const REMEMBER_PROMPTS = {
   low: (content) => `判断以下这句话是否同时满足两个条件：①包含用户明确陈述的具体事实；②带有强烈的情绪波动（强烈的喜悦、悲伤、愤怒、恐惧、激动等，而不是平淡陈述）。两个条件必须同时满足才回答"是"，只要有一个不满足就回答"否"。只回复"是"或"否"，不要解释。\n\n用户说：${content}`,
 }
 
+// 【2026-08-12 省 token】上面这个判断本身就是一次模型调用——也就是说
+// 每发一句话，除了真正的回复之外，后台还静悄悄多花两次调用：一次判断
+// "值不值得记"，判断通过再来一次"提炼成一句话"。绝大多数消息（"嗯"
+// "在吗""哈哈哈""好的"）根本不可能值得记，却照样各花一次。
+// 这里加一道零成本的本地预筛：明显不可能是事实陈述的短句直接判否，
+// 连请求都不发。判断标准刻意保守——只拦掉那些**几乎不可能**含信息的，
+// 稍微长一点、或者带了数字/时间/称呼的一律照旧交给模型判断，宁可多花
+// 一次也不漏记。
+const TRIVIAL_RE = /^[\s。，、！？!?~～…\.]*(嗯+|哦+|啊+|唉+|哈+|呵+|嘿+|好的?|行|可以|是的?|对的?|不是|没有|没|在吗?|在|早|晚安|你好|hi|hello|ok|okay|收到|谢谢|多谢|辛苦了|抱抱|么么|亲亲|晚安啦|😊|👍)[\s。，、！？!?~～…\.]*$/i
+function looksTrivial(content) {
+  const t = String(content || '').trim()
+  if (!t) return true
+  if (t.length <= 2) return true
+  if (TRIVIAL_RE.test(t)) return true
+  // 纯表情/纯标点
+  if (!/[\p{L}\p{N}]/u.test(t)) return true
+  return false
+}
+
 async function shouldRemember(content, sensitivity = 'medium') {
+  if (looksTrivial(content)) return false
   const buildPrompt = REMEMBER_PROMPTS[sensitivity] || REMEMBER_PROMPTS.medium
   try {
     const r = await fetch('https://api.deepseek.com/chat/completions', {
@@ -215,7 +235,13 @@ async function shouldRemember(content, sensitivity = 'medium') {
 }
 
 // ── 把用户这句话提炼成一句精简事实 ────────────────────────────
+// 【2026-08-12 省 token】本来就只有二十来个字的一句话，再花一次调用把它
+// "提炼成不超过 20 字"没有任何意义——提炼前后长度一样，信息量也一样。
+// 短句直接原样入库，只有真的长到需要压缩时才调模型。
+const EXTRACT_MIN_LEN = 26
 async function extractFact(content) {
+  const raw = String(content || '').trim()
+  if (raw.length <= EXTRACT_MIN_LEN) return `用户说：${raw}`
   try {
     const r = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
@@ -392,11 +418,19 @@ const ANTHROPIC_MODELS_URL = 'https://api.anthropic.com/v1/models'
 
 // 组装这次调用要发的 { url, headers, body }。system 和 messages（不含
 // system 那条）分开传入，两种协议各自决定 system 该塞在哪。
-function buildChatRequest(activeModel, { system, messages, temperature, thinkingEnabled, stream, maxTokens }) {
+function buildChatRequest(activeModel, { system, messages, temperature, thinkingEnabled, stream, maxTokens, cacheSystem }) {
   if (activeModel.protocol === 'anthropic') {
+    // Anthropic 没有 DeepSeek 那种自动前缀缓存，要显式标 cache_control
+    // 才会缓存。cacheSystem=true 时把 system 拆成一个带 ephemeral 标记的
+    // 文本块——命中之后这段的输入 token 只按十分之一计费，缓存五分钟内
+    // 每次调用都会续期，正常聊天节奏下基本一直是命中的。
+    // 只对主聊天开（system 那段够长、且逐字节稳定），一次性调用不开，
+    // 因为写缓存本身要多收 25%，只用一次反而更贵。
     const body = {
       model: activeModel.requestModel,
-      system,
+      system: cacheSystem && system
+        ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+        : system,
       messages,
       max_tokens: maxTokens || ANTHROPIC_DEFAULT_MAX_TOKENS,
       // 思考模式开启时官方要求 temperature 必须是 1，不能沿用用户设置的值
@@ -507,7 +541,82 @@ function deepseekThinking(requestModel, enabled) {
 }
 
 // ── 工具函数 ──────────────────────────────────────────────────
-function estimateToken(text) { return text ? Math.ceil(String(text).length / 4) : 0 }
+// 【2026-08-12 修复 · 省 token】原来一律按 "字符数 / 4" 估算 token，
+// 那是英文的经验值：英文平均 4 个字符 ≈ 1 token。中文完全不是这个比例
+// ——一个汉字大约就是 0.6~1 个 token。整份对话几乎全是中文的情况下，
+// 这个估算把真实用量**低估了三到四倍**，直接后果是
+// compress_threshold（默认 3000）几乎永远撞不到：真实上下文已经涨到
+// 一万多 token 了，estimateToken 还以为只有三千，于是历史压缩一直没被
+// 触发，每一轮都把越来越长的全量历史原样发给模型——这是这个应用里
+// 最隐蔽、也最花钱的一处。
+// 现在分开算：CJK 汉字按 0.7 token/字，其余（英文、数字、符号、空格）
+// 仍按 4 字符 1 token。不追求精确，只求量级对得上。
+function estimateToken(text) {
+  if (!text) return 0
+  const s = String(text)
+  const cjk = (s.match(/[\u3400-\u9FFF\uF900-\uFAFF\u3040-\u30FF]/g) || []).length
+  const rest = s.length - cjk
+  return Math.ceil(cjk * 0.7 + rest / 4)
+}
+
+// ============================================================
+// 模型单价表 —— 「数据罗盘」里那个\"这些 token 折算成多少钱\"
+// ============================================================
+// 单位：人民币元 / 每 100 万 token。key 用的是**发给 API 的真实模型名**
+// （resolveModel 里的 requestModel），前缀匹配，所以 'deepseek-v4' 这条
+// 能同时盖住 v4-flash / v4-pro 的各种后缀变体。
+//
+// 这张表只是个**默认值**，价格随时会变、各家还常年在打折，所以：
+//   · 想改价，不用改代码——在 settings 表里存一个 model_pricing 键，
+//     值是 JSON，形如 {"deepseek-v4-pro":{"in":4,"out":16}}，
+//     启动后立刻生效，会覆盖同名前缀的默认值；
+//   · 匹配不到任何一条前缀的模型，按 UNKNOWN_PRICE 估（保守取一个中间
+//     价），并且在返回里标出 estimated:true，前端会显示成"≈"，不会让人
+//     误以为这是精确账单。
+// 另外要说清楚一件事：这里算的是**按量计费的理论花费**，不含各家的
+// 缓存命中折扣（DeepSeek 命中前缀缓存的输入 token 只按十分之一收费），
+// 所以真实账单通常比这里显示的低，不会更高。
+const DEFAULT_PRICING = {
+  'deepseek-v4-flash': { in: 1,  out: 4  },
+  'deepseek-v4-pro':   { in: 4,  out: 16 },
+  'deepseek-v4':       { in: 1,  out: 4  },
+  'deepseek-chat':     { in: 2,  out: 8  },   // 已下线，只为老数据能算出个数
+  'deepseek-reasoner': { in: 4,  out: 16 },
+  'claude-haiku':      { in: 7,  out: 36 },
+  'claude-sonnet':     { in: 22, out: 108 },
+  'claude-opus':       { in: 36, out: 180 },
+  'moonshot':          { in: 12, out: 12 },
+  'glm':               { in: 5,  out: 5  },
+  'qwen':              { in: 4,  out: 12 },
+}
+const UNKNOWN_PRICE = { in: 2, out: 8 }
+
+function parsePricingOverride(cfg) {
+  const raw = cfg?.model_pricing
+  if (!raw) return {}
+  if (typeof raw === 'object') return raw
+  try { const o = JSON.parse(raw); return (o && typeof o === 'object') ? o : {} } catch { return {} }
+}
+
+// 拿一个模型名找单价。先精确、再最长前缀，都没有就返回 UNKNOWN_PRICE
+// 并标 estimated
+function priceFor(modelName, override = {}) {
+  const name = String(modelName || '').toLowerCase()
+  const table = { ...DEFAULT_PRICING, ...override }
+  if (table[name]) return { ...table[name], estimated: false }
+  let best = null
+  for (const key of Object.keys(table)) {
+    const k = key.toLowerCase()
+    if (name.includes(k) && (!best || k.length > best.length)) best = k
+  }
+  if (best) return { ...table[best], estimated: false }
+  return { ...UNKNOWN_PRICE, estimated: true }
+}
+
+// 元。四舍五入到分以下 4 位，前端自己决定显示几位
+function costOf({ input = 0, output = 0 }, price) {
+  return (input / 1e6) * price.in + (output / 1e6) * price.out
+}
 
 // ── 北京时间（Asia/Shanghai，UTC+8）工具 ─────────────────────
 // 服务器多半跑在 UTC 环境（如 Render），这里统一用固定 +8h 偏移换算，
@@ -534,10 +643,81 @@ function beijingDayRange(dateStr) {
 }
 
 // 组装 System Prompt 时统一注入当前北京时间 + 备忘（可选）
+// 注意：主聊天（runAssistantStream）已经改用下面那套"静态在前、易变在后"
+// 的布局，不再走这个函数；这里保留给日记 / 重新生成 / 合墨这三处——它们
+// 都是一次性的单轮调用，没有会被缓存的历史，怎么排都一样。
 function withTimeAwareness(systemPrompt, memo) {
   let out = `${systemPrompt}\n\n[当前时间]\n现在是北京时间 ${beijingTimeStr()}`
   if (memo && String(memo).trim()) out += `\n\n[备忘]\n${String(memo).trim()}`
   return out
+}
+
+// ============================================================
+// 提示词布局：静态在前、易变在后 —— 本批最大的一处省 token
+// ============================================================
+// 【原来为什么贵】
+// 所有走 OpenAI 兼容协议的服务（DeepSeek 尤其明显）都有一层**自动前缀
+// 缓存**：这次请求的开头如果跟上一次逐字节相同，相同的那一段输入 token
+// 按大约十分之一计费。命中与否只看"从第 0 个 token 开始连续相同多长"，
+// 一旦中间有一个字不一样，从那儿往后全部按原价重算。
+// 而原来的拼法是：
+//     system = 人格设定 + 【当前时间 XX:XX】 + 记忆检索结果 + …
+//     messages = 全部历史
+// 时间精确到分钟、记忆检索每轮结果都不同——也就是说**每一轮请求在很靠前
+// 的位置就断掉了**，后面那一大坨越滚越长的聊天历史，每一轮都在按原价
+// 重新买一遍。聊得越久，这笔冤枉钱涨得越快。
+//
+// 【现在怎么排】
+//     system   = 人格设定 + 茧星守则 + 备忘        ← 逐字节不变，能被缓存
+//     messages = 全部历史（数据库里存的原文，不动）  ← 只会往后追加，前缀稳定
+//     最后再补一条 = 当前时间 + 这一轮检索到的记忆    ← 唯一每轮不同的部分
+// 这样"人格 + 全部历史"整段都落在稳定前缀里，能吃到缓存价；每轮变化的
+// 只剩最后那一小块。顺带还有个好处：模型对**靠近末尾**的内容注意力最好，
+// 记忆放在这儿比埋在系统提示词中间更容易被真正用上。
+//
+// 【为什么留了个开关】
+// 追加的这条上下文，OpenAI 兼容协议下是一条额外的 user 消息，于是消息列表
+// 结尾会出现连着两条 user。DeepSeek/Moonshot/Qwen/GLM 都接受这种写法，但
+// 不排除某些第三方兼容实现严格要求 user/assistant 严格交替。真遇上哪家
+// 报"roles must alternate"，把下面这个常量改成 false 就立刻退回原来的
+// 拼法，其它什么都不用动。
+// （Anthropic 原生协议不走追加消息这条路——它对交替有硬要求，所以那边
+// 是把这段并进最后一条 user 消息的正文里，见 withTrailingContext。）
+const CACHE_FRIENDLY_LAYOUT = true
+
+// 静态段：这一轮跟上一轮必须逐字节一样，才可能命中缓存。所以这里只放
+// 人格设定、茧星守则、备忘这类"不到柯自己去改就不会变"的东西，绝不能
+// 把时间、检索结果这类每轮都不同的内容混进来。
+function buildStaticSystem(systemPrompt, memo, cocoonBlock = '') {
+  let out = String(systemPrompt || '')
+  if (cocoonBlock) out += cocoonBlock
+  if (memo && String(memo).trim()) out += `\n\n[备忘]\n${String(memo).trim()}`
+  return out
+}
+
+// 易变段：时间 + 这一轮检索到的各种记忆。为空就返回空字符串，调用方
+// 自己决定不追加。
+function buildVolatileContext(blocks) {
+  const body = blocks.filter(Boolean).join('')
+  const time = `[当前时间]\n现在是北京时间 ${beijingTimeStr()}`
+  return body ? `${time}${body}` : time
+}
+
+// 把易变段挂到消息列表末尾。两种协议的挂法不一样，原因见上。
+function withTrailingContext(protocol, messages, contextBlock) {
+  if (!contextBlock) return messages
+  const wrapped = `[以下是系统给你的上下文，不是他刚刚说的话——读完正常回他就好，不要复述这一段，也不要提到"系统"或"上下文"]\n${contextBlock}`
+  if (protocol === 'anthropic') {
+    const out = messages.slice()
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (out[i].role === 'user') {
+        out[i] = { ...out[i], content: `${out[i].content}\n\n${wrapped}` }
+        return out
+      }
+    }
+    return [...out, { role: 'user', content: wrapped }]
+  }
+  return [...messages, { role: 'user', content: wrapped }]
 }
 
 function parseSettings(rows) {
@@ -1032,7 +1212,17 @@ app.post('/api/chat', async (req, res) => {
 
     // 9. 保存 AI 回复（附带这次实际用的模型，供 Token 统计按模型拆分）
     const aiNow = new Date().toISOString()
-    const { data: savedMsg, error: aErr } = await supabase.from('messages').insert([{ session_id: sessionId, role: 'assistant', content: replyText, created_at: aiNow, visible: true, model: activeModel.id, reasoning_content: replyReasoning }]).select()
+    // 【2026-08-12 bug 修复】这条老的非流式接口一直没存 usage，走它生成的
+    // 回复在 Token 仪表盘里等于不存在（统计只算 tokens_input 非空的行）。
+    // 前端现在默认走流式，这条路平时用不到，但留着不修就是一个会让账目
+    // 对不上的坑，顺手补上。
+    const usage = parsed.usage
+    const { data: savedMsg, error: aErr } = await supabase.from('messages').insert([{
+      session_id: sessionId, role: 'assistant', content: replyText, created_at: aiNow, visible: true,
+      model: activeModel.id, reasoning_content: replyReasoning,
+      tokens_input:  usage ? usage.prompt_tokens     : null,
+      tokens_output: usage ? usage.completion_tokens : null,
+    }]).select()
     if (aErr) return res.status(500).json({ error: 'AI回复保存失败: ' + aErr.message })
 
     // 9.5 Ombre Brain hold（非阻塞；记忆暂停开启时跳过所有自动 hold）
@@ -1127,14 +1317,31 @@ function extractCocoonMark(fullText) {
 // 拼进 system prompt 的那一段：先摆现有内容（柯写的+枢写的），再附上
 // 使用说明——枢得先知道 COCOON_MARK 这个格式，才可能用上它，所以哪怕
 // 两边都还是空的，这段说明也要给，不能等有内容了才给。
+//
+// 【2026-08-12 · 柯问的那个问题的答案就写在这里】
+// 问：茧星到底是"每一轮都灌进去、白白多花 token 的记忆"，还是"像人格
+//     设定那样的设定"？
+// 答：从**计费**上看，两者根本没有区别——人格设定（system_prompt）同样
+//     是每一轮请求都要原样重发一遍的，模型没有任何跨请求的记忆，system
+//     prompt 每次都得重新读一遍才算数。所以"设定更省 token"这个直觉
+//     是不成立的：茧星和人格设定花的是同一种钱，按同样的方式花。
+//     真正决定贵不贵的只有两件事：① 这段文字有多长；② 它在提示词里的
+//     位置能不能吃到"前缀缓存"（见 buildStaticSystem 那一段的注释）。
+// 所以这一批做了三件事，而不是把它删掉：
+//   ① 位置：茧星从"排在检索记忆后面"挪到**静态段最前面**，跟人格设定
+//      贴在一起。这样它落在每次请求都完全一样的前缀里，DeepSeek 这类
+//      带自动前缀缓存的服务命中之后，这部分输入 token 只按十分之一
+//      计费——同样的内容，位置对了就便宜十倍。
+//   ② 措辞：整段从"关于你自己的记忆"改写成"守则"。柯的原话是"这里的
+//      记忆更像是守则，是要让家机知道能做什么不能做什么的地方"——那就
+//      按守则写，让模型也这么理解它，而不是当成一堆可以随口复述的旧事。
+//   ③ 长度：写入说明压掉一半字数，语义一个不少。这段是每轮固定成本，
+//      省下来的是每一轮都省。
 function buildCocoonPromptBlock(keEntries, shuEntries) {
-  let block = ''
-  if (keEntries.length || shuEntries.length) {
-    block += '\n\n[关于你自己的记忆 · 茧星]'
-    if (keEntries.length) block += `\n柯写下的、关于你的：\n${keEntries.map(t => `- ${t}`).join('\n')}`
-    if (shuEntries.length) block += `\n你自己记下的：\n${shuEntries.map(t => `- ${t}`).join('\n')}`
-  }
-  block += `\n\n如果这一轮你对"自己是谁"有新的觉察、想要记住，就在回复正文写完之后另起一行，按这个格式写：\n[枢想记住这件事] 具体内容\n这一行不会被用户看到，只会被存进你的自我记忆里，不算破坏上面"简短自然回复"这类要求；没有新的觉察就不用写，不必每次都凑一条。`
+  let block = '\n\n[茧星 · 关于你自己的守则]\n这不是可以随口复述的资料，是你的一部分：下面每一条都是你为人处世的依据，决定你能做什么、不做什么、以什么样子出现。不要主动背诵它们，让它们体现在你的反应里。'
+  if (keEntries.length) block += `\n柯为你定下的：\n${keEntries.map(t => `- ${t}`).join('\n')}`
+  if (shuEntries.length) block += `\n你自己认下的：\n${shuEntries.map(t => `- ${t}`).join('\n')}`
+  block += `\n如果这一轮你对"自己是谁"有了新的、值得长期作数的觉察，就在正文之后另起一行写：\n[枢想记住这件事] 内容\n这一行不显示给用户，也不算违反"简短回复"之类的要求；没有就不写，不用凑。`
   return block
 }
 
@@ -1172,28 +1379,33 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
     catch (e) { console.error('压缩失败:', e.message) }
   }
 
-  // 4. 系统提示词（注入当前北京时间 + 备忘，做到"时间感知"）
-  let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
-  if (memorySummary) systemPrompt += `\n【历史记忆】\n${memorySummary}`
+  // 4. 茧星：枢的自我守则（跟"柯/发生过的事情"无关，是"枢自己是谁"）。
+  //    它属于**静态段**——跟人格设定同一性质、同一位置，见
+  //    buildCocoonPromptBlock 和 buildStaticSystem 顶部的大段注释。
+  let cocoonMem
+  try { cocoonMem = await fetchCocoonMemory() }
+  catch (e) { console.error('茧星读取失败:', e.message); cocoonMem = { ke: [], shu: [], shuCount: 0 } }
+  const cocoonBlock = buildCocoonPromptBlock(cocoonMem.ke, cocoonMem.shu)
+
+  // 4.1 静态段：人格设定 + 茧星守则 + 备忘。这一段每一轮都必须逐字节
+  //     相同，才吃得到前缀缓存，所以时间、检索结果一律不许混进来。
+  const staticSystem = buildStaticSystem(system_prompt, cfg.memo, cocoonBlock)
+
+  // 4.2 以下几块都是**每轮都不一样**的，统一攒进 volatileBlocks，
+  //     最后一次性挂到消息列表末尾（见 withTrailingContext）
+  const volatileBlocks = []
+  if (memorySummary) volatileBlocks.push(`\n\n[更早之前聊过的（已压缩）]\n${memorySummary}`)
 
   // 4.5 Ombre Brain breath（用触发这次生成的那句话做检索 query）
-  let ombreMemory = ''
   try {
     const br = await callOmbreTool('breath', { query: triggerContent, max_results: 20 })
     const cm = cleanBreathMemory(br, 8)
     if (cm && !cm.includes('记忆池现在是空的') && cm.length > 0) {
-      ombreMemory = `\n\n[你记得的事]\n${cm}`
+      volatileBlocks.push(`\n\n[你记得的事]\n${cm}`)
       console.log('🧠 breath 命中，清洗后:', cm)
       send({ memoryHit: true, count: cm.split('；').length })
     }
   } catch (e) { console.error('记忆检索失败:', e.message) }
-  if (ombreMemory) systemPrompt += ombreMemory
-
-  // 4.6 茧星：枢的自我记忆（跟"柯/发生过的事情"无关，是"枢自己是谁"）
-  let cocoonMem
-  try { cocoonMem = await fetchCocoonMemory() }
-  catch (e) { console.error('茧星读取失败:', e.message); cocoonMem = { ke: [], shu: [], shuCount: 0 } }
-  systemPrompt += buildCocoonPromptBlock(cocoonMem.ke, cocoonMem.shu)
 
   // 4.7 本地记忆：日记 / 合墨 / 时轨。这跟上面 4.5 的 Ombre Brain 是
   //     两套完全不同的东西——记忆池装的是聊天里被判定"值得记住"、
@@ -1207,7 +1419,7 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   try {
     const localMem = await buildLocalMemoryBlock(triggerContent)
     if (localMem) {
-      systemPrompt += localMem
+      volatileBlocks.push(localMem)
       // 复用前端已有的"记忆命中"脉冲指示（ChatPage 里接的 memoryHit），
       // 让柯看得出这一轮他确实翻到了自己写过的东西
       if (localMem.includes('全文如下') || localMem.includes('正文如下')) send({ memoryHit: true, count: 1 })
@@ -1219,10 +1431,18 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   const { data: visHist } = await supabase.from('messages').select('role,content,quoted_text').eq('session_id', sessionId).eq('visible', true).order('created_at', { ascending: true })
 
   // 6. 构建消息（system 单独传，不塞进数组——两种协议各自决定放哪，见 buildChatRequest）
-  const chatMessages = (visHist || []).filter(m => m.content != null).map(m => ({
+  const historyMessages = (visHist || []).filter(m => m.content != null).map(m => ({
     role: m.role,
     content: m.quoted_text ? `[引用: ${m.quoted_text}]\n${m.content}` : String(m.content),
   }))
+
+  // 6.5 易变段挂到末尾（时间 + 这一轮检索到的记忆）。CACHE_FRIENDLY_LAYOUT
+  //     关掉的话退回老拼法：全部塞进 system 提示词，其它逻辑完全不变。
+  const volatileContext = buildVolatileContext(volatileBlocks)
+  const systemPrompt = CACHE_FRIENDLY_LAYOUT ? staticSystem : `${staticSystem}\n\n${volatileContext}`
+  const chatMessages = CACHE_FRIENDLY_LAYOUT
+    ? withTrailingContext(activeModel.protocol, historyMessages, volatileContext)
+    : historyMessages
 
   // 7. 停止生成：前端 AbortController.abort() 会让这次 fetch 的连接关闭，
   //    Node 侧的 req 会触发 'close'，据此中断与上游模型的连接。
@@ -1248,6 +1468,9 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
     //    activeModel.protocol 走 OpenAI 兼容或 Anthropic 原生
     const { url: chatUrl, headers: chatHeaders, body: chatBody } = buildChatRequest(activeModel, {
       system: systemPrompt, messages: chatMessages, temperature, thinkingEnabled, stream: true,
+      // 只有这里（主聊天）开缓存标记：system 段够长、逐字节稳定，
+      // 而且一天要调很多次，写一次缓存能被反复命中
+      cacheSystem: CACHE_FRIENDLY_LAYOUT,
     })
     const aiRes = await fetch(chatUrl, {
       method: 'POST', headers: chatHeaders, body: JSON.stringify(chatBody),
@@ -1303,6 +1526,19 @@ async function runAssistantStream({ req, res, send, sessionId, triggerContent })
   if (clientAborted) console.log('⏹ 生成被用户中止，已保留部分内容，长度:', fullText.length)
   const usage = usageRef.current
   const { cleanText, cocoonContent } = extractCocoonMark(fullText)
+
+  // 【2026-08-12 bug 修复】收尾时补发被"按住"的那一小截。
+  // cocoonSafeLen 会把尾部长得像 COCOON_MARK 前缀的几个字先按下不发，
+  // 等后面的字符来确认它到底是不是标记。问题在于：如果回复**正好就是
+  // 以这几个字结尾**（比如最后一句话恰好是"…他想记住这件事"里的某个
+  // 前缀，甚至只是一个换行加左方括号），流就结束了，确认永远等不到，
+  // 这几个字就再也没被发出去过——数据库里存的是完整的，气泡里却少了
+  // 一截，要刷新页面重新拉一次消息才会对上。现在流结束后按最终裁定的
+  // 正文长度补发一次差额，屏幕上和数据库里从此一定一致。
+  if (!clientAborted && !res.writableEnded && cleanText.length > sentLen) {
+    send({ token: cleanText.slice(sentLen) })
+    sentLen = cleanText.length
+  }
 
   // 10. 保存 AI 回复（含被中止时的部分内容；token 统计与中断标记写入真实字段；
   //     reasoning_content 是本轮新增：之前这里没存，思考过程只活在这一次
@@ -1604,8 +1840,24 @@ async function generateDiaryForDate(dateStr) {
   const skipped = raw === DIARY_SKIP_MARKER || raw.startsWith(DIARY_SKIP_MARKER)
   const diaryContent = skipped ? null : raw
 
+  // 【2026-08-12 新增】写日记这次调用花掉的 token 一并入库。
+  // 建表 SQL（已有表就跑这三句 alter）：
+  //   alter table diary add column if not exists tokens_input  integer;
+  //   alter table diary add column if not exists tokens_output integer;
+  //   alter table diary add column if not exists model text;
+  // 两个用处：① 日记列表里每篇底下能标出这一篇花了多少 token（柯要的
+  // "凡是消耗 token 的地方都要有标记"）；② 数据罗盘的总账里终于把日记
+  // 这条线算进去了——在这之前，日记是唯一一处真花了钱却完全不出现在
+  // 统计里的调用。注意跳过（skipped）的那次判断同样是真花了钱的，所以
+  // 不管写没写都存。
+  const dUsage = parsed.usage
   const { data, error } = await supabase.from('diary')
-    .upsert([{ date: dateStr, content: diaryContent, skipped, created_at: new Date().toISOString() }], { onConflict: 'date' })
+    .upsert([{
+      date: dateStr, content: diaryContent, skipped, created_at: new Date().toISOString(),
+      tokens_input:  dUsage ? dUsage.prompt_tokens     : null,
+      tokens_output: dUsage ? dUsage.completion_tokens : null,
+      model: activeModel.id,
+    }], { onConflict: 'date' })
     .select()
   if (error) throw Object.assign(new Error(error.message), { status: 500 })
 
@@ -1635,7 +1887,7 @@ app.post('/api/diary/generate', async (req, res) => {
 
 app.get('/api/diary/list', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('diary').select('date,content,created_at,skipped').order('date', { ascending: false }).limit(100)
+    const { data, error } = await supabase.from('diary').select('date,content,created_at,skipped,tokens_input,tokens_output,model').order('date', { ascending: false }).limit(100)
     if (error) return res.status(500).json({ error: error.message })
     res.json(data || [])
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -1643,7 +1895,7 @@ app.get('/api/diary/list', async (req, res) => {
 
 app.get('/api/diary/:date', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('diary').select('date,content,created_at,skipped').eq('date', req.params.date).maybeSingle()
+    const { data, error } = await supabase.from('diary').select('date,content,created_at,skipped,tokens_input,tokens_output,model').eq('date', req.params.date).maybeSingle()
     if (error) return res.status(500).json({ error: error.message })
     if (!data) return res.status(404).json({ error: '这天没有日记' })
     res.json(data)
@@ -1984,13 +2236,35 @@ app.get('/api/stats/tokens', async (req, res) => {
       .select('created_at,tokens_input,tokens_output,model')
       .eq('author', 'shu')
       .not('tokens_input', 'is', null)
-    const rows = [...(msgRows || []), ...(inkRows || []).map(r => ({ ...r, session_id: null }))]
+    // 日记也是真花钱的一次调用（枢每天自己判断写不写，那一次判断+撰写
+    // 是同一次请求）。原来这块完全没进统计，仪表盘上的数字比实际账单
+    // 少了一整条线。diary 表补了 tokens_input/tokens_output/model 三列
+    // 之后一并合进来，见 generateDiaryForDate。
+    const { data: diaryRows } = await supabase.from('diary')
+      .select('created_at,tokens_input,tokens_output,model')
+      .not('tokens_input', 'is', null)
+
+    const rows = [
+      ...(msgRows || []),
+      ...(inkRows || []).map(r => ({ ...r, session_id: null })),
+      ...(diaryRows || []).map(r => ({ ...r, session_id: null })),
+    ]
+
+    // 【2026-08-12 修复】原来用字符串直接比 created_at >= todayStart。
+    // Supabase 返回的时间戳形如 '2026-08-12T10:41:05.043674+00:00'，而
+    // todayStart 是 toISOString() 生成的 '...T16:00:00.000Z'——两种写法
+    // 的时区后缀不一样，字符串比较在同一秒的边界上会给出错误结果。
+    // 统一转成毫秒数再比，彻底绕开格式差异。
+    const ts = (v) => { const t = Date.parse(v); return Number.isNaN(t) ? 0 : t }
+    const todayMs  = ts(todayStart)
+    const weekMs   = ts(weekStart)
+    const sevenMs  = ts(sevenAgoStart)
 
     const sum = (list) => list.reduce((acc, r) => { acc.input += r.tokens_input || 0; acc.output += r.tokens_output || 0; return acc }, { input: 0, output: 0 })
 
     const all     = sum(rows)
-    const today   = sum(rows.filter(r => r.created_at >= todayStart))
-    const week    = sum(rows.filter(r => r.created_at >= weekStart))
+    const today   = sum(rows.filter(r => ts(r.created_at) >= todayMs))
+    const week    = sum(rows.filter(r => ts(r.created_at) >= weekMs))
     const session = sessionId ? sum(rows.filter(r => r.session_id === sessionId)) : null
 
     // 按模型拆分（迁移前的老记录没有 model 列，归到 deepseek-chat 名下）
@@ -2007,15 +2281,55 @@ app.get('/api/stats/tokens', async (req, res) => {
       const d = beijingDateStr(new Date(Date.now() - i * 24 * 3600 * 1000))
       trendMap[d] = { date: d, input: 0, output: 0 }
     }
-    rows.filter(r => r.created_at >= sevenAgoStart).forEach(r => {
+    rows.filter(r => ts(r.created_at) >= sevenMs).forEach(r => {
       const d = beijingDateStr(new Date(r.created_at))
       if (trendMap[d]) { trendMap[d].input += r.tokens_input || 0; trendMap[d].output += r.tokens_output || 0 }
     })
+
+    // ── 折算成钱（柯要的"花了多少钱"）───────────────────────────
+    // byModel 的 key 是设置里那份模型列表的 **id**，不是真正发给 API 的
+    // 模型名（比如 id 可能叫 'my-pro-key-2'）。单价表按真实模型名前缀匹配，
+    // 所以先用设置里的列表把 id → requestModel 映射出来；映射不到就拿 id
+    // 本身去匹配（老数据里 id 恰好就是模型名）。
+    const { data: pRows } = await supabase.from('settings').select('*')
+    const pcfg = parseSettings(pRows || [])
+    const override = parsePricingOverride(pcfg)
+    const idToRequestModel = {}
+    parseModelList(pcfg).forEach(m => { if (m?.id) idToRequestModel[m.id] = m.requestModel || m.id })
+
+    let anyEstimated = false
+    const costByModel = {}
+    let costAll = 0
+    Object.entries(byModel).forEach(([id, v]) => {
+      const price = priceFor(idToRequestModel[id] || id, override)
+      if (price.estimated) anyEstimated = true
+      const c = costOf(v, price)
+      costByModel[id] = { cost: c, estimated: price.estimated, in: price.in, out: price.out }
+      costAll += c
+    })
+
+    // 今天/本周/会话的花费要按各自区间里每条记录自己的模型单价分别算，
+    // 不能拿总花费去按比例摊——不同模型差价能到十几倍，摊出来的数没意义
+    const costOfRows = (list) => list.reduce((acc, r) => {
+      const id = r.model || 'deepseek-chat'
+      const price = priceFor(idToRequestModel[id] || id, override)
+      return acc + costOf({ input: r.tokens_input || 0, output: r.tokens_output || 0 }, price)
+    }, 0)
 
     res.json({
       session, today, week, all,
       byModel,
       trend7d: Object.values(trendMap),
+      cost: {
+        currency: 'CNY',
+        // 有任何一个模型没在单价表里查到，前端就把数字显示成"≈"
+        estimated: anyEstimated,
+        all: costAll,
+        today:   costOfRows(rows.filter(r => ts(r.created_at) >= todayMs)),
+        week:    costOfRows(rows.filter(r => ts(r.created_at) >= weekMs)),
+        session: sessionId ? costOfRows(rows.filter(r => r.session_id === sessionId)) : null,
+        byModel: costByModel,
+      },
     })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -2043,19 +2357,31 @@ const INK_NEXT_TURNS = ['continue', 'new', 'finalize']
 // 一段还没写完就被切断了——这是"续写只写一句"的次要成因之一
 const INK_MAX_TOKENS = Number(process.env.INK_MAX_TOKENS || 4000)
 
-// 【第十五批】记忆按模式给，不再三种模式一视同仁。
-// continue 接的是同一篇文章，前文可能真的在讲你们之间的事，记忆照旧
-// 全给。但 new / original 是"各写各的一篇作品"——把日记正文整块喂
-// 进去，模型会直接照着日记的腔调写（这就是"让他先写、写出来像日记"
-// 的直接原因）；Ombre 里那些真实往事也会一路把文章拽回"回忆＋抒情"。
-// 所以这两种模式默认不注入本地日记/时轨，Ombre 也不检索——他还是他
-// （人格设定和合墨那段规则都还在），只是这一篇不必写成回忆录。
-// 想改回去只动这张表就够。
+// 【第十六批 · 合墨彻底不带记忆】
+// 上一批只关掉了 new / original 两种模式的记忆注入，continue 还留着
+// （理由是"接的是同一篇文章，前文可能真的在讲你们之间的事"）。实际
+// 用下来这个例外站不住：只要把日记正文、时轨天数、Ombre 里那些真实
+// 往事塞进去，续写照样一路滑回"回忆 + 抒情"，写出来还是像日记——而
+// 合墨是**创作**的地方，日记另有去处。
+// 现在三种模式一视同仁：一律不检索 Ombre、不注入日记/时轨/合墨目录。
+// 需要的上下文一样不少——这一篇的题目和已有正文本来就整篇拼在用户
+// 消息里（见 buildInkUserPrompt），续写要接的东西他全看得见；缺的
+// 只是"你们之间真实发生过什么"，而那正是这里**不该**给的。
+// 顺带这也是一笔实打实的省钱：合墨这条路每次生成少发一大段上下文，
+// 而且 Ombre 检索那一次网络往返也整个省掉了。
+// 想局部改回去只动这张表就够，别的地方都按表办事。
 const INK_MEMORY_BY_MODE = {
-  continue: { ombre: true,  local: ['diary', 'chronos'] },
+  continue: { ombre: false, local: [] },
   new:      { ombre: false, local: [] },
   original: { ombre: false, local: [] },
 }
+
+// 茧星（自我守则）要不要也带进合墨？默认不带。
+// 茧星里混着柯写给他的、关于他自己的话，性质上更接近"记忆/设定"，
+// 带进创作现场同样会把文章往"写给对方的信"上拽。人格设定
+// （system_prompt）本身还在，所以写的仍然是他，不是一个陌生模型。
+// 想让他写作时也遵守茧星守则，把这里改成 true 即可。
+const INK_INCLUDE_COCOON = false
 
 // 写文章比聊天需要更大的发挥空间——聊天那档 temperature（默认 0.7）
 // 会让 new/original 一次次滑回同一套安全的抒情句式。只给非续写模式
@@ -2493,11 +2819,21 @@ async function runInkStream({ req, res, send, noteId, mode, instruction = '', ne
   // 这里是"续写只写一句"的主因：合墨复用了聊天的人格设定，而那份
   // 设定里写着"简短自然回复"。原来这段补充只说了"不要用对话口吻"，
   // 没把"简短"撤掉，模型当然一句话交差。
-  let systemPrompt = withTimeAwareness(system_prompt, cfg.memo)
+  // 合墨这边不注入时间/备忘之外的任何东西。备忘（cfg.memo）是柯自己
+  // 写给他的待办便签，跟创作无关，这里也不给——只保留人格设定本身。
+  let systemPrompt = String(system_prompt || '')
 
-  // 【第十五批】记忆按模式给，见上方 INK_MEMORY_BY_MODE。continue 全给；
-  // new/original 不注入日记/时轨，也不检索 Ombre——注了就等于先给它看
-  // 一叠日记范文，然后指望它写出不像日记的东西。
+  // 茧星守则默认不带进创作现场，见 INK_INCLUDE_COCOON
+  if (INK_INCLUDE_COCOON) {
+    try {
+      const cm = await fetchCocoonMemory()
+      systemPrompt += buildCocoonPromptBlock(cm.ke, cm.shu)
+    } catch (e) { console.error('合墨茧星读取失败:', e.message) }
+  }
+
+  // 【第十六批】三种模式一律不带记忆，见上方 INK_MEMORY_BY_MODE。
+  // 下面这两段检索代码保留但默认永远不会执行——留着是为了让"为什么
+  // 不带"这件事在代码里看得见，也方便哪天想局部放开时只改那张表。
   const memoryPlan = INK_MEMORY_BY_MODE[mode] || INK_MEMORY_BY_MODE.continue
 
   // 记忆检索：写这篇笔记的枢，得是聊天窗口里那个有记忆的枢，不是
@@ -2641,6 +2977,22 @@ async function runInkStream({ req, res, send, noteId, mode, instruction = '', ne
     content: appendWithBreak(note.content, cleanText), updated_at: now,
   }).eq('id', noteId)
   invalidateLocalMemory()   // 枢刚落的这一段，下一句聊天里就该记得
+
+  // 【2026-08-12 新增】往 Ombre Brain 记一条**事件**：「我在合墨的
+  // 《X》里写了一段」。
+  // 注意这跟以前那条"合墨不再往记忆库归档任何东西"的约定并不冲突：
+  // 当时去掉的是把**正文整段**塞进记忆池（那既贵又会污染检索结果）；
+  // 这里存的是一句十几个字的事件摘要，性质跟日记那条 hold 完全一样。
+  // 为什么要有它：localMemory 里那个「最近做过的事」是带遗忘曲线的，
+  // 一周之后就真的忘干净了；而柯问"你还记得我们那时候一起写的东西吗"
+  // 这类问题往往隔得更久。Ombre 是**按检索命中**才浮出来的长期池，
+  // 平时一个 token 都不占，只有他真问到相关的事才会被 breath 捞出来
+  // ——两条路正好互补：近的靠遗忘曲线自然记得，远的靠他主动问起才想起。
+  // 非阻塞，失败不影响这次生成，也不额外调用任何模型。
+  const inkTitle = (note.title && note.title !== '未命名手记') ? `《${note.title}》` : '一篇还没起名字的手记'
+  callOmbreTool('hold', { content: `我在合墨里往${inkTitle}写了一段：${cleanText.replace(/\s+/g, ' ').slice(0, 40)}` })
+    .then(() => console.log('🧠 合墨落笔已记入记忆:', inkTitle))
+    .catch(e => console.error('合墨 hold 失败:', e.message))
 
   // 枢起笔（白纸一张、由他写第一段）的话，标题也该由他来起，不用
   // 真人再手动填——只在标题还是默认值时才生成，不覆盖真人已经自己
